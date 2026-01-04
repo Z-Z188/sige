@@ -1,6 +1,9 @@
 # Copyright 2024-2025 The Alibaba Wan Team Authors. All rights reserved.
+import argparse
 import logging
 import os
+import sys
+import warnings
 import numpy as np
 
 import torch
@@ -10,8 +13,11 @@ import torch.nn.functional as F
 import torchvision
 import torchvision.transforms.functional as TF
 
-from einops import rearrange
+from einops import rearrange, repeat
 from abc import abstractmethod, ABC
+
+from sige.nn import Gather, Scatter, SIGEConv2d, SIGEModule
+from sige.utils import compute_difference_mask, dilate_mask, downsample_mask, reduce_mask
 
 from debugUtil import enable_custom_repr
 enable_custom_repr()
@@ -52,6 +58,8 @@ class CausalConv3d(nn.Conv3d):
                          2 * self.padding[0], 0)
         # nn.Conv3d内部会自动pad, 要关掉
         self.padding = (0, 0, 0)
+        self.time_padding = self._padding[4]
+        self.spatial_padding = (self._padding[2], self._padding[0])
 
     def forward(self, x, cache_x=None):
         padding = list(self._padding)
@@ -62,6 +70,645 @@ class CausalConv3d(nn.Conv3d):
         x = F.pad(x, padding)   # 默认就是零填充
 
         return super().forward(x)
+
+# Sparse utilities for 3D causal convs (pure PyTorch gather/scatter).
+class SIGEModule3d(nn.Module):
+    def __init__(self, call_super=True):
+        if call_super:
+            super().__init__()
+        self.mode = "full"
+        self.mask = None
+        self.timestamp = None
+        self.cache_id = 0
+        self.sparse_update = False
+        self.supported_dtypes = [torch.float32]
+
+    def set_mask(self, masks, cache, timestamp):
+        self.timestamp = timestamp
+
+    def set_mode(self, mode):
+        self.mode = mode
+
+    def set_cache_id(self, cache_id):
+        self.cache_id = cache_id
+
+    def clear_cache(self):
+        pass
+
+    def set_sparse_update(self, sparse_update):
+        self.sparse_update = sparse_update
+
+    def check_dtype(self, *args):
+        for x in args:
+            if x is not None:
+                assert isinstance(x, torch.Tensor)
+                if x.dtype not in self.supported_dtypes:
+                    raise NotImplementedError(
+                        "[%s] does not support dtype [%s]. Supported: %s"
+                        % (self.__class__.__name__, x.dtype, str(self.supported_dtypes))
+                    )
+
+    def check_dim(self, *args):
+        for x in args:
+            if x is not None:
+                assert isinstance(x, torch.Tensor)
+                if x.dim() != 5:
+                    raise NotImplementedError(
+                        "[%s] does not support input with dim [%d]!" % (self.__class__.__name__, x.dim())
+                    )
+
+
+class SIGEModel3d(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.mode = "full"
+        self.timestamp = 0
+
+    def set_masks(self, masks):
+        self.timestamp += 1
+        cache = {}
+        for module in self.modules():
+            if isinstance(module, (SIGEModule, SIGEModule3d)):
+                module.set_mask(masks, cache, self.timestamp)
+
+    def set_mode(self, mode):
+        self.mode = mode
+        for module in self.modules():
+            if isinstance(module, (SIGEModule, SIGEModule3d)):
+                module.set_mode(mode)
+
+    def clear_cache(self):
+        for module in self.modules():
+            if isinstance(module, (SIGEModule, SIGEModule3d)):
+                module.clear_cache()
+
+    def set_cache_id(self, cache_id):
+        for module in self.modules():
+            if isinstance(module, (SIGEModule, SIGEModule3d)):
+                module.set_cache_id(cache_id)
+
+    def set_sparse_update(self, sparse_update):
+        for module in self.modules():
+            if isinstance(module, (SIGEModule, SIGEModule3d)):
+                module.set_sparse_update(sparse_update)
+
+
+class SIGECausalConv3d(CausalConv3d, SIGEModule3d):
+    def __init__(self, *args, **kwargs):
+        CausalConv3d.__init__(self, *args, **kwargs)
+        SIGEModule3d.__init__(self, call_super=False)
+
+    def forward(self, x):
+        self.check_dtype(x)
+        self.check_dim(x)
+        if self.mode == "full":
+            return super().forward(x)
+        if self.mode in ["sparse", "profile"]:
+            return F.conv3d(x, self.weight, self.bias, self.stride, (0, 0, 0), self.dilation, self.groups)
+        raise NotImplementedError("Unknown mode: %s" % self.mode)
+
+
+class Gather3d(SIGEModule3d):
+    def __init__(self, conv: CausalConv3d, block_size, offset=None, verbose=False):
+        super().__init__()
+        if isinstance(block_size, int):
+            block_size = (block_size, block_size)
+
+        kernel_size = conv.kernel_size
+        stride = conv.stride
+        if not isinstance(kernel_size, tuple):
+            kernel_size = (kernel_size, kernel_size, kernel_size)
+        if not isinstance(stride, tuple):
+            stride = (stride, stride, stride)
+
+        n0 = max(block_size[0] - kernel_size[1], 0) // stride[1]
+        n1 = max(block_size[1] - kernel_size[2], 0) // stride[2]
+        b0 = n0 * stride[1] + kernel_size[1]
+        b1 = n1 * stride[2] + kernel_size[2]
+        if (b0, b1) != block_size:
+            warnings.warn("Change the block size from (%d, %d) to (%d, %d)" % (*block_size, b0, b1))
+
+        self.model_stride = (stride[1], stride[2])
+        self.kernel_size = (kernel_size[1], kernel_size[2])
+        self.block_size = (b0, b1)
+        self.block_stride = ((n0 + 1) * stride[1], (n1 + 1) * stride[2])
+
+        if offset is None:
+            self.offset = conv.spatial_padding
+        else:
+            if isinstance(offset, int):
+                offset = (offset, offset)
+            self.offset = offset
+        self.time_padding = conv.time_padding
+        self.verbose = verbose
+
+        self.input_res = None
+        self.active_indices = None
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        self.check_dtype(x)
+        self.check_dim(x)
+        b, c, t, _, _ = x.shape
+        if self.mode == "profile":
+            if self.active_indices is None:
+                raise RuntimeError("Active indices are not set for profile mode.")
+            output = torch.full(
+                (b * self.active_indices.size(0), c, t + self.time_padding, *self.block_size),
+                fill_value=x[0, 0, 0, 0, 0],
+                dtype=x.dtype,
+                device=x.device,
+            )
+        elif self.mode == "full":
+            self.input_res = x.shape[3:]
+            output = x
+        elif self.mode == "sparse":
+            if self.active_indices is None:
+                raise RuntimeError("Active indices are not set for sparse mode.")
+            pad_h, pad_w = self.offset
+            pad_t = self.time_padding
+            padded = F.pad(
+                x, (pad_w, self.block_size[1], pad_h, self.block_size[0], pad_t, 0)
+            )
+            num_active = self.active_indices.size(0)
+            if num_active == 0:
+                return x.new_empty((0, c, t + pad_t, self.block_size[0], self.block_size[1]))
+            blocks = []
+            for idx in self.active_indices:
+                y0 = int(idx[0].item()) + pad_h
+                x0 = int(idx[1].item()) + pad_w
+                blocks.append(padded[:, :, :, y0:y0 + self.block_size[0], x0:x0 + self.block_size[1]])
+            blocks = torch.stack(blocks, dim=1).contiguous()
+            output = blocks.view(b * num_active, c, t + pad_t, self.block_size[0], self.block_size[1])
+        else:
+            raise NotImplementedError("Unknown mode: %s" % self.mode)
+        return output
+
+    def set_mask(self, masks, cache, timestamp):
+        if self.timestamp != timestamp:
+            super().set_mask(masks, cache, timestamp)
+            if self.input_res is None:
+                raise RuntimeError("Input resolution is not set before set_mask.")
+            res = tuple(int(r) for r in self.input_res)
+            mask = masks[res]
+            self.mask = mask
+            key = ("active_indices_3d", *res, *self.block_size, *self.block_stride, *self.offset)
+            active_indices = cache.get(key, None)
+            if active_indices is None:
+                active_indices = reduce_mask(
+                    mask, self.block_size, self.block_stride, self.offset, verbose=self.verbose
+                )
+                cache[key] = active_indices
+            self.active_indices = active_indices
+
+
+class Scatter3d(SIGEModule3d):
+    def __init__(self, gather: Gather3d):
+        super().__init__()
+        self.gather = gather
+        self.output_res = None
+        self.original_outputs = {}
+
+    def clear_cache(self):
+        self.original_outputs = {}
+
+    def forward(self, x: torch.Tensor, residual: torch.Tensor = None) -> torch.Tensor:
+        self.check_dtype(x, residual)
+        self.check_dim(x, residual)
+        if self.mode == "profile":
+            output = torch.full(
+                (self.original_outputs[self.cache_id].size(0), x.size(1), *self.output_res),
+                fill_value=x[0, 0, 0, 0, 0],
+                dtype=x.dtype,
+                device=x.device,
+            )
+            if residual is not None:
+                output = output + residual
+            return output
+
+        if self.mode == "full":
+            output = x if residual is None else x + residual
+            self.output_res = output.shape[2:]
+            self.original_outputs[self.cache_id] = output.contiguous()
+            return output
+
+        if self.mode != "sparse":
+            raise NotImplementedError("Unknown mode: %s" % self.mode)
+
+        active_indices = self.gather.active_indices
+        if active_indices is None:
+            raise RuntimeError("Active indices are not set for sparse mode.")
+        num_active = active_indices.size(0)
+        if num_active == 0:
+            return self.original_outputs[self.cache_id].clone()
+
+        offset_h, offset_w = self.gather.offset
+        stride_h, stride_w = self.gather.model_stride
+        output = self.original_outputs[self.cache_id].clone()
+
+        b, c, t, h, w = output.shape
+        out_block_h = x.size(3)
+        out_block_w = x.size(4)
+        blocks = x.view(b, num_active, c, t, out_block_h, out_block_w)
+        for ib in range(num_active):
+            bi_h = int((offset_h + active_indices[ib, 0].item()) // stride_h)
+            bi_w = int((offset_w + active_indices[ib, 1].item()) // stride_w)
+            h_end = min(bi_h + out_block_h, h)
+            w_end = min(bi_w + out_block_w, w)
+            block = blocks[:, ib, :, :, :h_end - bi_h, :w_end - bi_w]
+            if residual is not None:
+                block = block + residual[:, :, :, bi_h:h_end, bi_w:w_end]
+            output[:, :, :, bi_h:h_end, bi_w:w_end] = block
+
+        if self.sparse_update:
+            self.original_outputs[self.cache_id] = output.contiguous()
+        return output
+
+
+class SIGEConv3dBlock(SIGEModule3d):
+    def __init__(self, in_channels, out_channels, kernel_size, stride=1, padding=0, block_size=6):
+        super().__init__()
+        self.conv = SIGECausalConv3d(
+            in_channels, out_channels, kernel_size, stride=stride, padding=padding
+        )
+        self.gather = Gather3d(self.conv, block_size=block_size)
+        self.scatter = Scatter3d(self.gather)
+
+    def forward(self, x):
+        x = self.gather(x)
+        x = self.conv(x)
+        x = self.scatter(x)
+        return x
+
+
+class SIGEResidualBlock3d(SIGEModule3d):
+    def __init__(self, in_dim, out_dim, dropout=0.0, main_block_size=6, shortcut_block_size=4):
+        super().__init__()
+        self.in_dim = in_dim
+        self.out_dim = out_dim
+
+        self.norm1 = RMS_norm(in_dim, images=False)
+        self.conv1 = SIGECausalConv3d(in_dim, out_dim, 3, padding=1)
+        self.norm2 = RMS_norm(out_dim, images=False)
+        self.dropout = nn.Dropout(dropout)
+        self.conv2 = SIGECausalConv3d(out_dim, out_dim, 3, padding=1)
+
+        self.gather1 = Gather3d(self.conv1, block_size=main_block_size)
+        self.scatter1 = Scatter3d(self.gather1)
+        self.gather2 = Gather3d(self.conv2, block_size=main_block_size)
+        self.scatter2 = Scatter3d(self.gather2)
+
+        if in_dim != out_dim:
+            self.shortcut = SIGECausalConv3d(in_dim, out_dim, 1)
+            self.shortcut_gather = Gather3d(self.shortcut, block_size=shortcut_block_size)
+            self.shortcut_scatter = Scatter3d(self.shortcut_gather)
+        else:
+            self.shortcut = None
+
+    def forward(self, x):
+        if self.shortcut is None:
+            shortcut = x
+        else:
+            shortcut = self.shortcut_gather(x)
+            shortcut = self.shortcut(shortcut)
+            shortcut = self.shortcut_scatter(shortcut)
+
+        h = self.norm1(x)
+        h = F.silu(h)
+        h = self.gather1(h)
+        h = self.conv1(h)
+        h = self.scatter1(h)
+
+        h = self.norm2(h)
+        h = F.silu(h)
+        h = self.dropout(h)
+        h = self.gather2(h)
+        h = self.conv2(h)
+        h = self.scatter2(h, shortcut)
+        return h
+
+
+class SIGEAttentionBlock3d(SIGEModule3d):
+    def __init__(self, dim, block_size=4):
+        super().__init__()
+        self.dim = dim
+        self.block_size = block_size
+
+        self.norm = RMS_norm(dim)
+        self.to_qkv = SIGEConv2d(dim, dim * 3, 1)
+        self.proj = SIGEConv2d(dim, dim, 1)
+
+        self.gather = Gather(self.to_qkv, block_size=block_size)
+        self.k_scatter = Scatter(self.gather)
+        self.v_scatter = Scatter(self.gather)
+        self.out_scatter = Scatter(self.gather)
+
+        nn.init.zeros_(self.proj.weight)
+
+    def forward(self, x):
+        b, c, t, h, w = x.size()
+        x2d = rearrange(x, 'b c t h w -> (b t) c h w')
+        x_in = x2d
+
+        x2d = self.gather(x2d)
+        x2d = self.norm(x2d)
+        q, k, v = self.to_qkv(x2d).chunk(3, dim=1)
+
+        k = self.k_scatter(k)
+        v = self.v_scatter(v)
+
+        if self.mode == "full":
+            bt, cc, hh, ww = q.shape
+            q = q.reshape(bt, cc, hh * ww)
+            q = q.permute(0, 2, 1)
+        elif self.mode in ("sparse", "profile"):
+            bt = b * t
+            _, cc, bh, bw = q.shape
+            nb = q.shape[0] // bt
+            q = q.reshape(bt, nb, cc, bh * bw)
+            q = q.permute(0, 1, 3, 2).reshape(bt, -1, cc)
+        else:
+            raise NotImplementedError("Unknown mode: %s" % self.mode)
+
+        bt, cc, hh, ww = k.shape
+        k = k.reshape(bt, cc, hh * ww)
+        w_ = torch.bmm(q, k)
+        w_ = w_ * (int(cc) ** (-0.5))
+        w_ = F.softmax(w_, dim=2)
+
+        v = v.reshape(bt, cc, hh * ww)
+        w_ = w_.permute(0, 2, 1)
+        h_ = torch.bmm(v, w_)
+
+        if self.mode == "full":
+            h_ = h_.reshape(bt, cc, hh, ww)
+            h_ = self.proj(h_)
+            h_ = self.out_scatter(h_, x_in)
+        elif self.mode in ("sparse", "profile"):
+            bh, bw = self.gather.block_size
+            h_ = h_.reshape(bt, cc, -1, bh, bw)
+            h_ = h_.permute(0, 2, 1, 3, 4).reshape(-1, cc, bh, bw)
+            h_ = self.proj(h_)
+            h_ = self.out_scatter(h_, x_in)
+        else:
+            raise NotImplementedError("Unknown mode: %s" % self.mode)
+
+        h_ = rearrange(h_, '(b t) c h w -> b c t h w', b=b, t=t)
+        return h_
+
+
+class SIGEResample3d(SIGEModule3d):
+    def __init__(self, dim, mode, block_size=6):
+        assert mode in ('none', 'upsample2d', 'upsample3d', 'downsample2d', 'downsample3d')
+        super().__init__()
+        self.dim = dim
+        self.resample_mode = mode
+
+        if mode == 'upsample2d':
+            self.upsample = Upsample(scale_factor=(2., 2.), mode='nearest-exact')
+            self.spatial_conv = SIGEConv2d(dim, dim // 2, 3, padding=1)
+            self.spatial_gather = Gather(self.spatial_conv, block_size=block_size)
+            self.spatial_scatter = Scatter(self.spatial_gather)
+        elif mode == 'upsample3d':
+            self.upsample = Upsample(scale_factor=(2., 2.), mode='nearest-exact')
+            self.spatial_conv = SIGEConv2d(dim, dim // 2, 3, padding=1)
+            self.spatial_gather = Gather(self.spatial_conv, block_size=block_size)
+            self.spatial_scatter = Scatter(self.spatial_gather)
+            self.time_conv = SIGECausalConv3d(dim, dim * 2, (3, 1, 1), padding=(1, 0, 0))
+            self.time_gather = Gather3d(self.time_conv, block_size=block_size)
+            self.time_scatter = Scatter3d(self.time_gather)
+        elif mode == 'downsample2d':
+            self.pad = nn.ZeroPad2d((0, 1, 0, 1))
+            self.spatial_conv = SIGEConv2d(dim, dim, 3, stride=2, padding=0)
+            self.spatial_gather = Gather(self.spatial_conv, block_size=block_size)
+            self.spatial_scatter = Scatter(self.spatial_gather)
+        elif mode == 'downsample3d':
+            self.pad = nn.ZeroPad2d((0, 1, 0, 1))
+            self.spatial_conv = SIGEConv2d(dim, dim, 3, stride=2, padding=0)
+            self.spatial_gather = Gather(self.spatial_conv, block_size=block_size)
+            self.spatial_scatter = Scatter(self.spatial_gather)
+            self.time_conv = SIGECausalConv3d(dim, dim, (3, 1, 1), stride=(2, 1, 1), padding=(0, 0, 0))
+            self.time_gather = Gather3d(self.time_conv, block_size=block_size)
+            self.time_scatter = Scatter3d(self.time_gather)
+        else:
+            self.spatial_conv = None
+
+    def forward(self, x):
+        b, c, t, h, w = x.size()
+        if self.resample_mode == 'none':
+            return x
+
+        if self.resample_mode == 'upsample3d':
+            x = self.time_gather(x)
+            x = self.time_conv(x)
+            x = self.time_scatter(x)
+            x = x.reshape(b, 2, c, t, h, w)
+            x = torch.stack((x[:, 0, :, :, :, :], x[:, 1, :, :, :, :]), dim=3)
+            x = x.reshape(b, c, t * 2, h, w)
+
+        t = x.shape[2]
+        x2d = rearrange(x, 'b c t h w -> (b t) c h w')
+        if self.resample_mode in ('upsample2d', 'upsample3d'):
+            x2d = self.upsample(x2d)
+            x2d = self.spatial_gather(x2d)
+            x2d = self.spatial_conv(x2d)
+            x2d = self.spatial_scatter(x2d)
+        else:
+            x2d = self.spatial_gather(x2d)
+            if self.mode == "full":
+                x2d = self.pad(x2d)
+            x2d = self.spatial_conv(x2d)
+            x2d = self.spatial_scatter(x2d)
+        x = rearrange(x2d, '(b t) c h w -> b c t h w', t=t)
+
+        if self.resample_mode == 'downsample3d':
+            if x.size(2) < self.time_conv.kernel_size[0]:
+                pad_t = self.time_conv.kernel_size[0] - x.size(2)
+                x = F.pad(x, (0, 0, 0, 0, pad_t, 0))
+            x = self.time_gather(x)
+            x = self.time_conv(x)
+            x = self.time_scatter(x)
+
+        return x
+
+
+class SIGEEncoder3d(SIGEModel3d):
+    def __init__(
+        self,
+        dim=128,
+        z_dim=4,
+        dim_mult=[1, 2, 4, 4],
+        num_res_blocks=2,
+        attn_scales=[],
+        temperal_downsample=[True, True, False],
+        dropout=0.0,
+        block_size=6,
+        attn_block_size=4,
+    ):
+        super().__init__()
+        self.dim = dim
+        self.z_dim = z_dim
+        self.dim_mult = dim_mult
+        self.num_res_blocks = num_res_blocks
+        self.attn_scales = attn_scales
+        self.temperal_downsample = temperal_downsample
+
+        dims = [dim * u for u in [1] + dim_mult]
+        scale = 1.0
+
+        self.conv1 = SIGEConv3dBlock(3, dims[0], 3, padding=1, block_size=block_size)
+
+        downsamples = []
+        for i, (in_dim, out_dim) in enumerate(zip(dims[:-1], dims[1:])):
+            for _ in range(num_res_blocks):
+                downsamples.append(SIGEResidualBlock3d(in_dim, out_dim, dropout, block_size, block_size))
+                if scale in attn_scales:
+                    downsamples.append(SIGEAttentionBlock3d(out_dim, block_size=attn_block_size))
+                in_dim = out_dim
+
+            if i != len(dim_mult) - 1:
+                mode = 'downsample3d' if temperal_downsample[i] else 'downsample2d'
+                downsamples.append(SIGEResample3d(out_dim, mode=mode, block_size=block_size))
+                scale /= 2.0
+        self.downsamples = nn.Sequential(*downsamples)
+
+        self.middle = nn.Sequential(
+            SIGEResidualBlock3d(out_dim, out_dim, dropout, block_size, block_size),
+            SIGEAttentionBlock3d(out_dim, block_size=attn_block_size),
+            SIGEResidualBlock3d(out_dim, out_dim, dropout, block_size, block_size),
+        )
+
+        self.norm_out = RMS_norm(out_dim, images=False)
+        self.conv_out = SIGEConv3dBlock(out_dim, z_dim * 2, 3, padding=1, block_size=block_size)
+
+    def forward(self, x):
+        x = self.conv1(x)
+        x = self.downsamples(x)
+        x = self.middle(x)
+        x = self.norm_out(x)
+        x = F.silu(x)
+        x = self.conv_out(x)
+        return x
+
+
+class SIGEDecoder3d(SIGEModel3d):
+    def __init__(
+        self,
+        dim=128,
+        z_dim=4,
+        dim_mult=[1, 2, 4, 4],
+        num_res_blocks=2,
+        attn_scales=[],
+        temperal_upsample=[False, True, True],
+        dropout=0.0,
+        block_size=6,
+        attn_block_size=4,
+    ):
+        super().__init__()
+        self.dim = dim
+        self.z_dim = z_dim
+        self.dim_mult = dim_mult
+        self.num_res_blocks = num_res_blocks
+        self.attn_scales = attn_scales
+        self.temperal_upsample = temperal_upsample
+
+        dims = [dim * u for u in [dim_mult[-1]] + dim_mult[::-1]]
+        scale = 1.0 / 2**(len(dim_mult) - 2)
+
+        self.conv1 = SIGEConv3dBlock(z_dim, dims[0], 3, padding=1, block_size=block_size)
+
+        self.middle = nn.Sequential(
+            SIGEResidualBlock3d(dims[0], dims[0], dropout, block_size, block_size),
+            SIGEAttentionBlock3d(dims[0], block_size=attn_block_size),
+            SIGEResidualBlock3d(dims[0], dims[0], dropout, block_size, block_size),
+        )
+
+        upsamples = []
+        for i, (in_dim, out_dim) in enumerate(zip(dims[:-1], dims[1:])):
+            if i == 1 or i == 2 or i == 3:
+                in_dim = in_dim // 2
+            for _ in range(num_res_blocks + 1):
+                upsamples.append(SIGEResidualBlock3d(in_dim, out_dim, dropout, block_size, block_size))
+                if scale in attn_scales:
+                    upsamples.append(SIGEAttentionBlock3d(out_dim, block_size=attn_block_size))
+                in_dim = out_dim
+
+            if i != len(dim_mult) - 1:
+                mode = 'upsample3d' if temperal_upsample[i] else 'upsample2d'
+                upsamples.append(SIGEResample3d(out_dim, mode=mode, block_size=block_size))
+                scale *= 2.0
+        self.upsamples = nn.Sequential(*upsamples)
+
+        self.norm_out = RMS_norm(out_dim, images=False)
+        self.conv_out = SIGEConv3dBlock(out_dim, 3, 3, padding=1, block_size=block_size)
+
+    def forward(self, x):
+        x = self.conv1(x)
+        x = self.middle(x)
+        x = self.upsamples(x)
+        x = self.norm_out(x)
+        x = F.silu(x)
+        x = self.conv_out(x)
+        return x
+
+
+class SIGEWanVAE3d(SIGEModel3d):
+    def __init__(
+        self,
+        dim=128,
+        z_dim=4,
+        dim_mult=[1, 2, 4, 4],
+        num_res_blocks=2,
+        attn_scales=[],
+        temperal_downsample=[True, True, False],
+        dropout=0.0,
+        block_size=6,
+        attn_block_size=4,
+    ):
+        super().__init__()
+        self.z_dim = z_dim
+        self.encoder = SIGEEncoder3d(
+            dim=dim,
+            z_dim=z_dim,
+            dim_mult=dim_mult,
+            num_res_blocks=num_res_blocks,
+            attn_scales=attn_scales,
+            temperal_downsample=temperal_downsample,
+            dropout=dropout,
+            block_size=block_size,
+            attn_block_size=attn_block_size,
+        )
+        self.conv1 = SIGEConv3dBlock(z_dim * 2, z_dim * 2, 1, block_size=block_size)
+        self.conv2 = SIGEConv3dBlock(z_dim, z_dim, 1, block_size=block_size)
+        self.decoder = SIGEDecoder3d(
+            dim=dim,
+            z_dim=z_dim,
+            dim_mult=dim_mult,
+            num_res_blocks=num_res_blocks,
+            attn_scales=attn_scales,
+            temperal_upsample=temperal_downsample[::-1],
+            dropout=dropout,
+            block_size=block_size,
+            attn_block_size=attn_block_size,
+        )
+
+    def encode(self, x):
+        h = self.encoder(x)
+        moments = self.conv1(h)
+        return moments.chunk(2, dim=1)
+
+    def decode(self, z):
+        z = self.conv2(z)
+        return self.decoder(z)
+
+    def forward(self, x, deterministic=True):
+        mu, log_var = self.encode(x)
+        if deterministic:
+            z = mu
+        else:
+            std = torch.exp(0.5 * log_var)
+            z = mu + std * torch.randn_like(std)
+        x_recon = self.decode(z)
+        return x_recon, mu, log_var
 
 # 归一化层用RMSNorm
 class RMS_norm(nn.Module):
@@ -910,6 +1557,170 @@ def psnr_np(x, y, max_val=255.0):
         return float("inf")
     return 10.0 * np.log10((max_val ** 2) / mse)
 
+
+def load_img_sd_style(path: str, size: tuple[int, int] | None = None) -> torch.Tensor:
+    from PIL import Image
+
+    image = Image.open(path).convert("RGB")
+    w, h = image.size
+    print(f"loaded input image of size ({w}, {h}) from {path}")
+    if size is None:
+        w, h = w - w % 32, h - h % 32
+    else:
+        w, h = size
+        w, h = w - w % 32, h - h % 32
+    image = image.resize((w, h), resample=Image.LANCZOS)
+    image = np.array(image).astype(np.float32) / 255.0
+    image = image[None].transpose(0, 3, 1, 2)
+    image = torch.from_numpy(image)
+    return 2.0 * image - 1.0
+
+
+def video_tensor_to_numpy_uint8(video: torch.Tensor) -> np.ndarray:
+    video = (video * 0.5 + 0.5).clamp(0, 1)
+    video = video[0].permute(1, 2, 3, 0).contiguous()
+    video = (video * 255).round().clamp(0, 255).to(torch.uint8).cpu().numpy()
+    return video
+
+
+def save_video_uint8(video: np.ndarray, out_path: str, fps: int = 16):
+    torchvision.io.write_video(out_path, video, fps=fps)
+
+
+def copy_sige_weights_from_base(base_model: nn.Module, sige_model: nn.Module):
+    module_types = (nn.Conv2d, nn.Conv3d, RMS_norm)
+    base_modules = [m for m in base_model.modules() if isinstance(m, module_types)]
+    sige_modules = [m for m in sige_model.modules() if isinstance(m, module_types)]
+    if len(base_modules) != len(sige_modules):
+        raise RuntimeError(
+            f"Module count mismatch: base={len(base_modules)} sige={len(sige_modules)}"
+        )
+    for src, dst in zip(base_modules, sige_modules):
+        if any(a.shape != b.shape for a, b in zip(src.state_dict().values(), dst.state_dict().values())):
+            raise RuntimeError("Parameter shape mismatch during weight transfer.")
+        dst.load_state_dict(src.state_dict(), strict=True)
+
+
+def get_sige_vae_args():
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--init_img", type=str, required=True, help="path to the original image")
+    parser.add_argument("--edited_img", type=str, required=True, help="path to the edited image")
+    parser.add_argument("--out", type=str, default="sige_vae_recon.mp4")
+    parser.add_argument("--fps", type=int, default=16)
+    parser.add_argument("--frames", type=int, default=10)
+    parser.add_argument("--device", type=str, default=None, choices=["cpu", "cuda", "mps"])
+    parser.add_argument("--vae_pth", type=str, default=None)
+    parser.add_argument("--z_dim", type=int, default=16)
+    parser.add_argument("--size", type=int, default=None, help="square resize (multiple of 32)")
+    parser.add_argument("--height", type=int, default=512)
+    parser.add_argument("--width", type=int, default=512)
+    return parser.parse_args()
+
+
+@torch.no_grad()
+def run_sige_vae3d_test():
+    from torchprofile import profile_macs
+
+    args = get_sige_vae_args()
+
+    if args.device is None:
+        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    else:
+        device = torch.device(args.device)
+    torch.manual_seed(0)
+
+    if args.size is not None:
+        target_hw = (args.size, args.size)
+    elif args.height is not None and args.width is not None:
+        target_hw = (args.width, args.height)
+    else:
+        target_hw = None
+
+    edited_img = load_img_sd_style(args.edited_img, size=target_hw)
+    if target_hw is None:
+        target_hw = (edited_img.shape[-1], edited_img.shape[-2])
+    init_img = load_img_sd_style(args.init_img, size=target_hw)
+
+    edited_img = edited_img.to(device=device, dtype=torch.float32)
+    init_img = init_img.to(device=device, dtype=torch.float32)
+
+    edited_img = repeat(edited_img, "1 ... -> b ...", b=1)
+    init_img = repeat(init_img, "1 ... -> b ...", b=1)
+
+    difference_mask = compute_difference_mask(init_img, edited_img)
+    print("Edit Ratio: %.2f%%" % (difference_mask.sum() / difference_mask.numel() * 100))
+    difference_mask = dilate_mask(difference_mask, 5)
+    masks = downsample_mask(difference_mask, min_res=(4, 4), dilation=1)
+
+    b, c, t = 1, 3, args.frames
+    edited_input = edited_img.unsqueeze(2).repeat(1, 1, t, 1, 1)
+    original_input = init_img.unsqueeze(2).repeat(1, 1, t, 1, 1)
+
+    cfg = dict(
+        dim=96,
+        dim_mult=[1, 2, 4, 4],
+        num_res_blocks=2,
+        attn_scales=[],
+        temperal_downsample=[False, True, True],
+        dropout=0.0,
+    )
+
+    if args.vae_pth is None:
+        args.vae_pth = os.path.join(
+            repo_root, "wan_models/Wan2.1-T2V-1.3B/Wan2.1_VAE.pth"
+        )
+    if not os.path.exists(args.vae_pth):
+        raise FileNotFoundError(f"VAE checkpoint not found: {args.vae_pth}")
+
+    base_model = _video_vae(pretrained_path=args.vae_pth, z_dim=args.z_dim, device=device, **cfg)
+    base_model.eval()
+
+    model = SIGEWanVAE3d(z_dim=args.z_dim, **cfg).to(device)
+    copy_sige_weights_from_base(base_model, model)
+    model.eval()
+    del base_model
+
+    class ReconWrapper(nn.Module):
+        def __init__(self, inner):
+            super().__init__()
+            self.inner = inner
+
+        def forward(self, x):
+            return self.inner(x, deterministic=True)[0]
+
+    wrapper = ReconWrapper(model)
+
+    # Full pass on original input to populate caches (same as sdedit_runner flow).
+    model.set_mode("full")
+    full_macs = profile_macs(wrapper, (original_input,))
+    model.clear_cache()
+    if device.type == "cuda":
+        torch.cuda.empty_cache()
+
+    model.set_mode("full")
+    full_output = wrapper(original_input)
+
+    # Sparse pass on edited input using the difference mask.
+    model.set_mode("sparse")
+    model.set_masks(masks)
+    sparse_output = wrapper(edited_input)
+
+    model.set_mode("profile")
+    sparse_macs = profile_macs(wrapper, (edited_input,))
+
+    print("Full MACs: %.2fG" % (full_macs / 1e9))
+    print("Sparse MACs: %.2fG" % (sparse_macs / 1e9))
+
+    full_video = video_tensor_to_numpy_uint8(full_output)
+    sparse_video = video_tensor_to_numpy_uint8(sparse_output)
+
+    save_video_uint8(sparse_video, args.out, fps=args.fps)
+    base_out, ext = os.path.splitext(args.out)
+    save_video_uint8(full_video, f"{base_out}_full{ext}", fps=args.fps)
+    print("saved sparse to", args.out)
+    print("saved full to", f"{base_out}_full{ext}")
+
+
 @torch.no_grad()
 def main():
     device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
@@ -953,4 +1764,8 @@ def main():
 
 
 if __name__ == "__main__":
-    main()
+    if "--sige-vae-test" in sys.argv:
+        sys.argv.remove("--sige-vae-test")
+        run_sige_vae3d_test()
+    else:
+        main()
