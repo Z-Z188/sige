@@ -22,11 +22,17 @@ def reduce_mask(
         if isinstance(stride, int):
             stride = (stride, stride)
         H, W = mask.shape
+
         # Max Pooling only supports float tensor
         mask = mask.view(1, 1, H, W).to(torch.float32)
+        # 补充的是 0（零元素）
         mask = F.pad(mask, (padding[1], block_size[1], padding[0], block_size[0]))
+        
+        # 核心操作
         mask_pooled = F.max_pool2d(mask, block_size, stride)
-        mask_pooled = mask_pooled[0, 0] > 0.5
+
+        # mask_pooled = mask_pooled[0, 0] > 0.5
+        mask_pooled = mask_pooled[0, 0] > 0.0
         active_indices = torch.nonzero(mask_pooled)
         active_indices[:, 0] = stride[0] * active_indices[:, 0] - padding[0]
         active_indices[:, 1] = stride[1] * active_indices[:, 1] - padding[1]
@@ -36,7 +42,7 @@ def reduce_mask(
             print("Block Sparsity: %d/%d=%.2f%%" % (num_active, total, 100 * num_active / total))
         return active_indices.to(torch.int32).contiguous()
 
-
+# 参数 mask 可以是 torch.Tensor，也可以是 numpy.ndarray
 def dilate_mask(
     mask: Union[torch.Tensor, np.ndarray], dilation: Union[int, Tuple[int, int]]  # [C, H, W] or [H, W]
 ) -> Union[torch.Tensor, np.ndarray]:
@@ -113,6 +119,6 @@ def downsample_mask(
         w //= 2
         if h < min_h and w < min_w:
             break
-        else:
-            interpolated_mask = F.interpolate(interpolated_mask, (h, w), mode="bilinear", align_corners=False)
+        
+        interpolated_mask = F.interpolate(interpolated_mask, (h, w), mode="bilinear", align_corners=False)
     return masks

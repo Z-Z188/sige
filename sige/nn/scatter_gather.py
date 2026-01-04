@@ -46,6 +46,7 @@ class ScatterGather(SIGEModule):
             output = x
             self.output_res = output.shape[2:]
             self.original_outputs[self.cache_id] = output.contiguous()
+        
         elif self.mode == "sparse":
             device = x.device.type
             runtime = self.runtime[device]

@@ -31,6 +31,7 @@ class InpaintingRunner(BaseRunner):
         device = self.device
 
         prompts = [args.prompt]
+        uc = None
         if args.scale != 1.0:
             uc = model.get_learned_conditioning([""])
         c = model.get_learned_conditioning(prompts)
@@ -67,6 +68,7 @@ class InpaintingRunner(BaseRunner):
             x0=init_latent,
             conv_masks=masks,
         )
+        
         if isinstance(model.first_stage_model, SIGEAutoencoderKL):
             assert isinstance(model.first_stage_model.decoder, SIGEModel)
             model.first_stage_model.decoder.set_mode("full")

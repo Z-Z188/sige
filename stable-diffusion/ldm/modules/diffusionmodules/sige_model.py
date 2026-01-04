@@ -18,6 +18,7 @@ class SIGEResnetBlock(SIGEModule):
         main_block_size=6,
         shortcut_block_size=4,
     ):
+
         super().__init__()
         self.in_channels = in_channels
         out_channels = in_channels if out_channels is None else out_channels
@@ -32,7 +33,10 @@ class SIGEResnetBlock(SIGEModule):
 
         self.norm1 = Normalize(in_channels)
         self.conv1 = MainConv2d(in_channels, out_channels, kernel_size=3, stride=1, padding=1)
-        if temb_channels > 0:
+        
+        # VAE的ResnetBlock2D模块是没有时间步的输入的，即time_embeds=None, 
+        # 其他的和上面Unet中的ResnetBlock2D一致
+        if temb_channels > 0:   
             self.temb_proj = nn.Linear(temb_channels, out_channels)
         self.norm2 = Normalize(out_channels)
         self.dropout = nn.Dropout(dropout)
@@ -144,6 +148,8 @@ class SIGEDownsample(SIGEModule):
         super(SIGEDownsample, self).__init__()
         assert with_conv
         # no asymmetric padding in torch conv, must do it ourselves
+
+        # 用 stride=2 的卷积下采样
         self.conv = nn.Conv2d(in_channels, in_channels, kernel_size=3, stride=2, padding=0)
         self.gather = Gather(self.conv, block_size=block_size)
         self.scatter = Scatter(self.gather)
@@ -203,12 +209,12 @@ class SIGEEncoder(SIGEModel):
         self.resolution = resolution
         self.in_channels = in_channels
 
-        # downsampling
+        # 把通道数由3变为128, H和W不变
         self.conv_in = nn.Conv2d(in_channels, self.ch, kernel_size=3, stride=1, padding=1)
 
         curr_res = resolution
         in_ch_mult = (1,) + tuple(ch_mult)
-        self.in_ch_mult = in_ch_mult
+        self.in_ch_mult = in_ch_mult    # ch: 通道数         
         self.down = nn.ModuleList()
         for i_level in range(self.num_resolutions):
             block = nn.ModuleList()
@@ -222,11 +228,14 @@ class SIGEEncoder(SIGEModel):
                     )
                 )
                 block_in = block_out
+                # attn_resolutions is None
                 if curr_res in attn_resolutions:
                     attn.append(make_attn(block_in, attn_type=attn_type))
             down = nn.Module()
             down.block = block
             down.attn = attn
+
+            # 最后一个模块没有下采样
             if i_level != self.num_resolutions - 1:
                 down.downsample = SIGEDownsample(block_in, resamp_with_conv)
                 curr_res = curr_res // 2

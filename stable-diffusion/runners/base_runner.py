@@ -80,17 +80,36 @@ class BaseRunner:
             with model.ema_scope():
                 self.generate()
 
-    def save_samples(self, samples):
+
+    def _add_tag_to_path(self, path: str, tag: str, i: int = None) -> str:
+        """
+        img2img.png + tag=origin  -> img2img_origin.png
+        xxx/abc.jpg + tag=edit -> xxx/abc_edit.jpg
+        如果 batch 多张，追加 _{i}
+        """
+        base, ext = os.path.splitext(path)
+        if i is None:
+            return f"{base}_{tag}{ext}"
+        else:
+            return f"{base}_{tag}_{i:03d}{ext}"
+
+
+    def save_samples(self, samples, tag):
         args = self.args
         samples = torch.clamp((samples + 1) / 2, min=0, max=1)
         samples = samples.cpu().permute(0, 2, 3, 1).numpy()
         checked_image, _ = check_safety(samples)
         checked_image_torch = torch.from_numpy(checked_image)
         checked_image_torch = checked_image_torch.permute(0, 3, 1, 2)
+
+        if args.output_path is not None:
+            os.makedirs(os.path.dirname(os.path.abspath(args.output_path)), exist_ok=True)
+
         for i, sample in enumerate(checked_image_torch):
             sample = 255.0 * rearrange(sample.cpu().numpy(), "c h w -> h w c")
             img = Image.fromarray(sample.astype(np.uint8))
             img = put_watermark(img, self.wm_encoder)
             if args.output_path is not None:
-                os.makedirs(os.path.dirname(os.path.abspath(args.output_path)), exist_ok=True)
-                img.save(args.output_path)
+                # os.makedirs(os.path.dirname(os.path.abspath(args.output_path)), exist_ok=True)
+                save_path = self._add_tag_to_path(args.output_path, tag, i if checked_image_torch.shape[0] > 1 else None)
+                img.save(save_path)

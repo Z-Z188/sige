@@ -23,6 +23,7 @@ class Gather(SIGEModule):
         if isinstance(block_size, int):
             block_size = (block_size, block_size)
 
+        # 下取整
         n0 = max(block_size[0] - conv.kernel_size[0], 0) // conv.stride[0]
         n1 = max(block_size[1] - conv.kernel_size[1], 0) // conv.stride[1]
         b0 = n0 * conv.stride[0] + conv.kernel_size[0]
@@ -34,7 +35,13 @@ class Gather(SIGEModule):
         self.kernel_size = conv.kernel_size
 
         self.block_size = (b0, b1)
+
+        # block_stride的含义
+        # 当你在输入上移动一个 block，到下一个 block 的起始位置时，
+        # 在原始特征图上，要跨过多少像素，才能刚好对应“下一个输出位置块”
         self.block_stride = ((n0 + 1) * conv.stride[0], (n1 + 1) * conv.stride[1])
+
+
         if offset is None:
             self.offset = conv.padding
         else:
@@ -56,6 +63,7 @@ class Gather(SIGEModule):
         self.check_dtype(x, scale, shift)
         self.check_dim(x, scale, shift)
         b, c, h, w = x.shape
+
         if self.mode == "profile":
             output = torch.full(
                 (b * self.active_indices.size(0), c, *self.block_size),
@@ -68,11 +76,13 @@ class Gather(SIGEModule):
             if shift is not None:
                 output = output + shift[0, 0, 0, 0]
             output = activation(output, self.activation_name)
+
         elif self.mode == "full":
             self.input_res = x.shape[2:]
             assert scale is None
             assert shift is None
             output = x
+            
         elif self.mode == "sparse":
             device = x.device.type
             runtime = self.runtime[device]

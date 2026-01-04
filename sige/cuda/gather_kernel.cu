@@ -18,7 +18,7 @@ __global__ void gather_cuda_kernel(
         ActivationType activationType,
         bool activationFirst) {
     int index = blockIdx.x * blockDim.x + threadIdx.x;
-    if (index >= total)
+    if (index >= total) // 如果我没有对应的元素，就下班。
         return;
     int t = index;
     int intraBw = t % S;
@@ -28,8 +28,13 @@ __global__ void gather_cuda_kernel(
     int cc = t % C;
     t /= C;
     int ib = t % numActive, bb = t / numActive;
+
+    // 把第 ib 个激活 block 的左上角坐标 (biH, biW)，加上 block 内偏移 (intraBh, intraBw)，
+    // 映射回原始特征图 (H, W) 上的真实像素位置，并做越界保护。
+
+    // activeIndices 里存的就是每个 active block 在原图上的左上角（top-left）坐标。
     int biH = activeIndices[ib << 1];
-    int hh = biH + intraBh;
+    int hh = biH + intraBh; // 就是在把 block 内坐标映射回原图的真实坐标。
     if (hh < 0 || hh >= H) {
         output[index] = 0;
         return;
@@ -40,6 +45,7 @@ __global__ void gather_cuda_kernel(
         output[index] = 0;
         return;
     }
+
     auto p = bb * C * H * W + cc * H * W + hh * W + ww;
     auto z = x[p];
     if (!activationFirst) {
@@ -66,6 +72,9 @@ __global__ void gather_cuda_kernel(
     output[index] = z;
 }
 
+
+// gather_cuda 是一个 CUDA kernel 的“胶水层（glue code / launcher）”，
+// 负责把 PyTorch 世界的 Tensor，翻译成 CUDA 世界的指针 + 整数参数。
 torch::Tensor gather_cuda(
         const torch::Tensor &x,
         int bSizeH, int bSizeW,
@@ -76,8 +85,11 @@ torch::Tensor gather_cuda(
         bool activationFirst = false) {
     const int R = bSizeH, S = bSizeW;
     const int numActive = activeIndices.size(0);
+
+    // 我接下来要创建一个新 Tensor，它的数据类型和 x 一样，放在和 x 一样的设备上，而且它只是个普通结果，不参与反向传播。
     auto options = torch::TensorOptions().dtype(x.dtype()).device(x.device()).requires_grad(false);
     auto xData = x.data_ptr<float>();
+
     const auto activeIndicesData = activeIndices.data_ptr<int>();
 
     const int B = x.size(0), C = x.size(1), H = x.size(2), W = x.size(3);
@@ -108,7 +120,10 @@ torch::Tensor gather_cuda(
 
     const auto activationType = getActivationType(activationName);
 
-    const int total = output.numel();
+    // 这就是“一共要算多少个 output 元素”
+    const int total = output.numel();   // 783 * 16 * 6 * 6 = 451008
+
+    // 上采样
     const dim3 blocks((total + threads - 1) / threads, 1);
     gather_cuda_kernel<<<blocks, threads>>>(
             total, numActive,
@@ -122,3 +137,30 @@ torch::Tensor gather_cuda(
 
     return output;
 }
+
+
+/*
+在 C 语言直觉下: 
+✔️ 4 重循环
+✔️ 每次算 1 个 output 元素
+✔️ index 是线性展开后的编号
+
+for (int bb = 0; bb < B * numActive; bb++) {
+    for (int cc = 0; cc < C; cc++) {
+        for (int hh = 0; hh < R; hh++) {
+            for (int ww = 0; ww < S; ww++) {
+
+                int index = ((bb * C + cc) * R + hh) * S + ww;
+
+                output[index] = ...; // gather + scale + shift + activation
+            }
+        }
+    }
+}
+
+CUDA 不是不循环，而是：
+把「for 循环的每一次迭代，交给一个线程来做」
+
+CPU C: 串行
+CUDA: 并行
+*/

@@ -369,6 +369,7 @@ class DDIMSampler(object):
         for i, step in enumerate(iterator):
             index = total_steps - i - 1
             ts = torch.full((x_latent_init.shape[0],), step, device=x_latent_init.device, dtype=torch.long)
+            
             self.model.model.diffusion_model.set_mode("full")
             x_dec_init, _ = self.p_sample_ddim(
                 x_dec_init,
@@ -379,6 +380,7 @@ class DDIMSampler(object):
                 unconditional_guidance_scale=unconditional_guidance_scale,
                 unconditional_conditioning=unconditional_conditioning,
             )
+            
             self.model.model.diffusion_model.set_mode("sparse")
             self.model.model.diffusion_model.set_masks(masks)
             x_dec_edited, _ = self.p_sample_ddim(

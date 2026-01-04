@@ -5,6 +5,10 @@
 #include <iostream>
 #include <torch/extension.h>
 
+
+// activeIndices 一般定义在“上游（高分辨率）特征图”的坐标系中
+// 而 scatter 的目标 y 可能是 下采样后的特征图
+
 __global__ void scatter_cuda_kernel(
         int total, int numActive,
         int B, int C, int H, int W,

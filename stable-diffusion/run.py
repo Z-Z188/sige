@@ -2,6 +2,8 @@ import argparse
 
 from utils import set_seed
 
+from debugUtil import enable_custom_repr
+enable_custom_repr()
 
 def main():
     parser = argparse.ArgumentParser()

@@ -55,8 +55,10 @@ class SDEditRunner(BaseRunner):
             assert init_img is not None, "Must provide an initial image for SIGE model"
             init_img = load_img(args.init_img).to(device)
             init_img = repeat(init_img, "1 ... -> b ...", b=1)
+
             model.first_stage_model.encoder.set_mode("full")
             init_latent = model.get_first_stage_encoding(model.encode_first_stage(init_img))
+
             model.first_stage_model.encoder.set_mode("sparse")
             model.first_stage_model.encoder.set_masks(masks)
             edited_latent = model.get_first_stage_encoding(model.encode_first_stage(edited_img))
@@ -74,8 +76,10 @@ class SDEditRunner(BaseRunner):
         t_enc = int(args.strength * args.ddim_steps)
         print(f"target t_enc is {t_enc} steps")
 
+
         noise = torch.randn_like(edited_latent)
 
+        # stochastic_encode 就是"加噪"
         z_enc_edited = sampler.stochastic_encode(edited_latent, torch.tensor([t_enc]).to(device), noise=noise)
         if is_sige_model:
             z_enc_init = sampler.stochastic_encode(init_latent, torch.tensor([t_enc]).to(device), noise=noise)
@@ -94,14 +98,19 @@ class SDEditRunner(BaseRunner):
             samples = sampler.decode(
                 z_enc_edited, c, t_enc, unconditional_guidance_scale=args.scale, unconditional_conditioning=uc
             )
-        # samples = model.decode_first_stage(samples)
+
+
         if isinstance(model.first_stage_model, SIGEAutoencoderKL):
             difference_mask = dilate_mask(difference_mask, 40)
             masks = downsample_mask(difference_mask, min_res=(4, 4), dilation=0)
             assert isinstance(model.first_stage_model.decoder, SIGEModel)
             model.first_stage_model.decoder.set_mode("full")
-            model.decode_first_stage(samples_init)
+
+            # model.decode_first_stage(samples_init)
+            samples_init = model.decode_first_stage(samples_init)
+            self.save_samples(samples_init, tag="origin")
+
             model.first_stage_model.decoder.set_masks(masks)
             model.first_stage_model.decoder.set_mode("sparse")
         samples = model.decode_first_stage(samples)
-        self.save_samples(samples)
+        self.save_samples(samples, tag="edit")

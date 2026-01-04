@@ -21,7 +21,7 @@ safety_checker = StableDiffusionSafetyChecker.from_pretrained(safety_model_id)
 
 def load_model_from_config(config, weight_path: str, verbose: bool = False):
     print(f"Loading model from {weight_path}")
-    pl_sd = torch.load(weight_path, map_location="cpu")
+    pl_sd = torch.load(weight_path, map_location="cpu", weights_only=False)
     if "global_step" in pl_sd:
         print(f"Global Step: {pl_sd['global_step']}")
     sd = pl_sd["state_dict"]

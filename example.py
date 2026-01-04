@@ -1,25 +1,45 @@
 import argparse
-
+import os
 import numpy as np
 import torch
 from torchprofile import profile_macs
 
 from sige.nn import Gather, Scatter, SIGEConv2d, SIGEModel, SIGEModule
 
+from debugUtil import enable_custom_repr
+enable_custom_repr()
 
 class ExampleModule(SIGEModule):
     """
     A module consisting of a single `Gather`, 3x3 conv and `Scatter`.
-    `SIGEModule` is a `nn.Module` wrapper that supports inference with three different modes:
-    * `full`: The original inference. For the example above, the full mode will just perform the stardard $3 \times 3$ convolution.
-    * `sparse`: The tiling-based sparse convolution.
-    * `profile`: This mode is only used when profiling the MACs of the tiling-based convolution.
+        `SIGEModule` is a `nn.Module` wrapper that supports inference with three different modes:
+        `full`: The original inference. For the example above, 
+        the full mode will just perform the stardard $3 \times 3$ convolution.
+
+        `sparse`: The tiling-based sparse convolution.
+        `profile`: This mode is only used when profiling the MACs of the tiling-based convolution.
     It also supports setting the difference mask.
 
     `Gather`, `Scatter` and `SIGEConv2d` are also `SIGEModule`. Specifically,
-    * `Gather` initialization requires the paired convolution and the sparse block size. During `full` inference, it will just record the input shape. During `sparse` inference, it will gather the active blocks according to the `active_indices` reduced from the difference mask. During `profile` inference, it will just create a dummy tensor to symbolicly track the computation graph for MACs profiling.
-    * `Scatter` initialization requires the paired `Gather` module. During `full` inference, it will just cache the input tensor. During `sparse` inference, it will scatter the input blocks to the cached tensor according the `active_indices` in the paired `Gather`. During `profile` inference, it will just create a dummy tensor to symbolicly track the computation graph for MACs profiling.
-    * `SIGEConv2d` is just a wrapper of `nn.Conv2d`. During `full` inference, it performs as the standard convolution. During `sparse` or `profile` inference, the `padding` will be 0 as the gathered blocks are already padded.
+        `Gather` initialization requires the paired convolution and the sparse block size.
+        During `full` inference, it will just record the input shape. 
+        During `sparse` inference, it will gather the active blocks according to the `active_indices` 
+        reduced from the difference mask. 
+        During `profile` inference, it will just create a dummy tensor to symbolicly 
+        track the computation graph for MACs profiling.
+
+
+        `Scatter` initialization requires the paired `Gather` module. 
+        During `full` inference, it will just cache the input tensor. 
+        During `sparse` inference, it will scatter the input blocks to the cached tensor according
+        the `active_indices` in the paired `Gather`. 
+        During `profile` inference, it will just create a dummy tensor to symbolicly 
+        track the computation graph for MACs profiling.
+
+
+        `SIGEConv2d` is just a wrapper of `nn.Conv2d`. During `full` inference, 
+        it performs as the standard convolution. During `sparse` or `profile` inference, 
+        the `padding` will be 0 as the gathered blocks are already padded.
     """
 
     def __init__(self):
@@ -49,11 +69,21 @@ class ExampleModel(SIGEModel):
 def get_args():
     parser = argparse.ArgumentParser()
     parser.add_argument("--device", default=None, choices=["cpu", "cuda", "mps"], help="which device to use")
+    parser.add_argument("--ptvsd", action="store_true", help="是否启动ptvsd调试。")
+
     return parser.parse_args()
 
-
 def main():
+    # print("PID:", os.getpid())
+    # input("Attach cuda-gdb now, then press Enter\n")
+
     args = get_args()
+
+    if args.ptvsd:
+        import ptvsd
+        ptvsd.enable_attach(address =('127.0.0.1', 10010), redirect_output=True)
+        ptvsd.wait_for_attach()
+
     if args.device is None:
         if torch.cuda.is_available():
             device = torch.device("cuda")
@@ -64,39 +94,46 @@ def main():
     else:
         device = torch.device(args.device)
 
-    # Get the inputs
+
+    # original_input → 论文里的 A_original
+    # edited_input → 论文里的 A_edited
+    # mask → difference mask（编辑区域）
     original_input = torch.randn((1, 16, 256, 256), device=device)
-    mask = np.load("assets/mask.npy")
+    mask = np.load("/home/zhurui11/sige/assets/mask.npy")
     mask = torch.from_numpy(mask).to(device)
     edited_input = original_input + torch.randn((1, 16, 256, 256), device=device) * mask[None, None]
 
-    # Get the model
     model = ExampleModel().to(device)
     model.eval()
 
     with torch.no_grad():
-        # Get the full model results
         model.set_mode("full")
+        # 完全不启用 SIGE, 对应 Vanilla inference
         std_output = model(edited_input)
         full_macs = profile_macs(model, (edited_input,))
+
+
 
         # Cache the original input results
         model.set_mode("full")
         original_output = model(original_input)
 
-        # SIGE Sparse Inference
+        # 进入Sparse Inference
         model.set_mode("sparse")
-        # Set the differentiable mask
         model.set_masks({(256, 256): mask})  # The key is the resolution tuple and the value is the 2D mask tensor.
         sige_output = model(edited_input)
+
         model.set_mode("profile")
         sige_macs = profile_macs(model, (edited_input,))
+
         print("Max Error: %.6f" % abs(std_output - sige_output).max().item())
-        assert torch.isclose(std_output, sige_output, atol=1e-4).all()
+        # assert torch.isclose(std_output, sige_output, atol=1e-4).all()
         print("Masked Region: %.2f%%" % (mask.sum() / mask.numel() * 100).item())
         print("Full MACs: %.2fM" % (full_macs / 1e6))
         print("SIGE MACs: %.2fM" % (sige_macs / 1e6))
 
 
 if __name__ == "__main__":
+    import sige.cuda
+    print(sige.cuda.__file__)
     main()

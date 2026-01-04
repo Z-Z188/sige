@@ -146,6 +146,18 @@ class BuildMPSExtension(BuildExtension):
 
 if __name__ == "__main__":
     extra_compile_args = {"cxx": ["-g", "-O3", "-lgomp"], "nvcc": ["-O3"]}
+    # extra_compile_args={
+    #     "cxx": ["-g",
+    #             #  "-O0"
+    #             ],  # 对于 C++ 文件启用调试模式
+    #     "nvcc": [
+    #         # "-I" + os.path.join(current_dir, "third_party/glm/"),
+    #         "-g",              # 启用调试信息
+    #         "-G",              # 启用完整的调试符号（可选）
+    #         # "-O0"              # 禁用优化
+    #     ]
+    # }
+    
     if platform.system() != "Darwin":
         extra_compile_args["cxx"].append("-fopenmp")
     build_extension_cls = BuildExtension
