@@ -1,14 +1,4 @@
 # Copyright 2024-2025 The Alibaba Wan Team Authors. All rights reserved.
-'''
-实现的功能:
-每次下一帧(下一个chunk)处理之前, 把scatter中的cache即original_outputs,
-按照光流映射到下一帧的位置,新露出的区域即mask,通过调用set_masks函数进行设置
-
-sparse_update设置为True
-这样新生成的mask区域会写回original_outputs,方便下一帧用
-'''
-
-import argparse
 import logging
 import os
 import numpy as np
@@ -23,31 +13,12 @@ import torchvision.transforms.functional as TF
 from einops import rearrange
 from abc import abstractmethod, ABC
 
-# import sys
-# sys.path.append("/home/zhurui11/")
-
-# TODO: 有2D的gather，scatter需要处理, flow_cache
-from sige.nn import Gather, Scatter
-from sige3d import SIGECausalConv3d, Gather3d, Scatter3d, ScatterWithBlockResidual3d, ScatterGather3d, SIGEModel3d, SIGEModule3d
-from sige.utils import dilate_mask, downsample_mask
-
-
 from debugUtil import enable_custom_repr
 enable_custom_repr()
 
 
 repo_root = "/media/cephfs/video/VideoUsers/thu2025/zhurui11/StreamDiffusionV2"
 
-
-from dataclasses import dataclass
-from typing import Tuple
-@dataclass(frozen=True)
-class Conv3dMeta:
-    kernel_size: Tuple[int, int, int] = (1, 1, 1)
-    stride: Tuple[int, int, int] = (1, 1, 1)
-    padding: Tuple[int, int, int] = (0, 0, 0)
-    dilation: Tuple[int, int, int] = (1, 1, 1)
-    groups: int = 1
 
 class VAEInterface(ABC, torch.nn.Module):
     @abstractmethod
@@ -92,38 +63,22 @@ class CausalConv3d(nn.Conv3d):
 
         return super().forward(x)
 
-# TODO: 看需不需要继承SIGEModule
 # 归一化层用RMSNorm
 class RMS_norm(nn.Module):
-    def __init__(self, dim, channel_first=True, images=True, bias=False, eps=1e-6):
+    def __init__(self, dim, channel_first=True, images=True, bias=False):
         super().__init__()
         broadcastable_dims = (1, 1, 1) if not images else (1, 1)
         shape = (dim, *broadcastable_dims) if channel_first else (dim,)
 
         self.channel_first = channel_first
         self.scale = dim**0.5
-        self.eps = eps
-
-        # 这些 nn.Parameter 在推理（inference）时，正常情况下就是从训练好的权重里加载进来的
         self.gamma = nn.Parameter(torch.ones(shape))
         self.bias = nn.Parameter(torch.zeros(shape)) if bias else 0.
 
-    def forward(self, x, return_inv_norm: bool = False):
-        dim = 1 if self.channel_first else -1
-        norm = x.norm(2, dim=dim, keepdim=True) + self.eps
-        inv_norm = 1.0 / norm
-        y = x * inv_norm * self.scale * self.gamma + self.bias
-        if return_inv_norm:
-            return y, inv_norm
-        return y
-
-            # return F.normalize(
-        #     x, dim=(1 if self.channel_first else
-        #             -1)) * self.scale * self.gamma + self.bias
-
-        # F.normalize等价的两步写法:
-        # norm = torch.norm(x, p=2, dim=1, keepdim=True)  # 计算L2范数
-        # normalized_x = x / norm
+    def forward(self, x):
+        return F.normalize(
+            x, dim=(1 if self.channel_first else
+                    -1)) * self.scale * self.gamma + self.bias
 
 
 class Upsample(nn.Upsample):
@@ -135,84 +90,50 @@ class Upsample(nn.Upsample):
         return super().forward(x.float()).type_as(x)
 
 
-class Resample(SIGEModule3d):
+class Resample(nn.Module):
 
-    def __init__(self, dim, resample_mode, block_size=6):
-        assert resample_mode in ('none', 'upsample2d', 'upsample3d', 'downsample2d',
+    def __init__(self, dim, mode):
+        assert mode in ('none', 'upsample2d', 'upsample3d', 'downsample2d',
                         'downsample3d')
         super().__init__()
         self.dim = dim
-        self.resample_mode = resample_mode
+        self.mode = mode
 
         # layers
-        if resample_mode == 'upsample2d':
-            # self.resample = nn.Sequential(
-            #     Upsample(scale_factor=(2., 2.), mode='nearest-exact'),
-            #     nn.Conv2d(dim, dim // 2, 3, padding=1))
-            
-            self.spatupsample = Upsample(scale_factor=(2., 2.), mode='nearest-exact')
-            self.conv = nn.Conv2d(dim, dim // 2, 3, padding=1)
-            self.gather2d = Gather(self.conv, block_size=block_size)
-            self.scatter2d = Scatter(self.gather2d)
-
-        elif resample_mode == 'upsample3d':
-            # self.resample = nn.Sequential(
-            #     Upsample(scale_factor=(2., 2.), mode='nearest-exact'),
-            #     nn.Conv2d(dim, dim // 2, 3, padding=1))
-
-            self.spatupsample = Upsample(scale_factor=(2., 2.), mode='nearest-exact')
-            self.conv = nn.Conv2d(dim, dim // 2, 3, padding=1)
-            self.gather2d = Gather(self.conv, block_size=block_size)
-            self.scatter2d = Scatter(self.gather2d)
-
-            # TODO: 和ResnetBlck一样，也是两次卷积操作，看看能不能用scatter_gather来合并中间的一次scatter和gather
-            # 先用普通的两次代替
-            self.time_conv = SIGECausalConv3d(
+        if mode == 'upsample2d':
+            self.resample = nn.Sequential(
+                Upsample(scale_factor=(2., 2.), mode='nearest-exact'),
+                nn.Conv2d(dim, dim // 2, 3, padding=1))
+        elif mode == 'upsample3d':
+            self.resample = nn.Sequential(
+                Upsample(scale_factor=(2., 2.), mode='nearest-exact'),
+                nn.Conv2d(dim, dim // 2, 3, padding=1))
+            self.time_conv = CausalConv3d(
                 dim, dim * 2, (3, 1, 1), padding=(1, 0, 0))
-            self.gather3d = Gather3d(self.time_conv, block_size=block_size)
-            self.scatter3d = Scatter3d(self.gather3d)
 
-
-        elif resample_mode == 'downsample2d':
-            # self.resample = nn.Sequential(
-            #     nn.ZeroPad2d((0, 1, 0, 1)), # 右边、下边补 1，保证 stride=2 时尺寸整齐（常见 trick
-            #     nn.Conv2d(dim, dim, 3, stride=(2, 2)))
-
-            self.downpad = nn.ZeroPad2d((0, 1, 0, 1))
-            self.conv = nn.Conv2d(dim, dim, 3, stride=(2, 2))
-            self.gather2d = Gather(self.conv, block_size=block_size)
-            self.scatter2d = Scatter(self.gather2d)
-            
-        elif resample_mode == 'downsample3d':
-            # self.resample = nn.Sequential(
-            #     nn.ZeroPad2d((0, 1, 0, 1)),
-            #     nn.Conv2d(dim, dim, 3, stride=(2, 2)))
-
-            self.downpad = nn.ZeroPad2d((0, 1, 0, 1))
-            self.conv = nn.Conv2d(dim, dim, 3, stride=(2, 2))
-            self.gather2d = Gather(self.conv, block_size=block_size)
-            self.scatter2d = Scatter(self.gather2d)
-
-            self.time_conv = SIGECausalConv3d(
+        elif mode == 'downsample2d':
+            self.resample = nn.Sequential(
+                nn.ZeroPad2d((0, 1, 0, 1)), # 右边、下边补 1，保证 stride=2 时尺寸整齐（常见 trick
+                nn.Conv2d(dim, dim, 3, stride=(2, 2)))
+        elif mode == 'downsample3d':
+            self.resample = nn.Sequential(
+                nn.ZeroPad2d((0, 1, 0, 1)),
+                nn.Conv2d(dim, dim, 3, stride=(2, 2)))
+            self.time_conv = CausalConv3d(
                 dim, dim, (3, 1, 1), stride=(2, 1, 1), padding=(0, 0, 0))
-            self.gather3d = Gather3d(self.time_conv, block_size=block_size)
-            self.scatter3d = Scatter3d(self.gather3d)
 
         else:
             self.resample = nn.Identity()
 
-
-    def forward(self, x, feat_cache=None, feat_idx=[0], is_first_frame=False):
+    def forward(self, x, feat_cache=None, feat_idx=[0]):
         b, c, t, h, w = x.size()
-        if self.resample_mode == 'upsample3d':
+        if self.mode == 'upsample3d':
             if feat_cache is not None:
                 idx = feat_idx[0]
                 if feat_cache[idx] is None:
                     feat_cache[idx] = 'Rep'
                     feat_idx[0] += 1
                 else:
-                    x = self.gather3d(x)
-
                     cache_x = x[:, :, -CACHE_T:, :, :].clone()
                     if cache_x.shape[2] < CACHE_T and feat_cache[
                             idx] is not None and feat_cache[idx] != 'Rep':
@@ -242,57 +163,29 @@ class Resample(SIGEModule3d):
                     x = torch.stack((x[:, 0, :, :, :, :], x[:, 1, :, :, :, :]),dim=3)
                     x = x.reshape(b, c, t * 2, h, w)
 
-                    x = self.scatter3d(x)
-                    
-
         # 统一做空间 2D resample
         t = x.shape[2]
         x = rearrange(x, 'b c t h w -> (b t) c h w')
-        # x = self.resample(x)
-        if self.resample_mode == 'upsample3d' or self.resample_mode == 'upsample2d':
-            x = self.spatupsample(x)
-            x = self.gather2d(x)
-            x = self.conv(x)    # 2D卷积
-            x = self.scatter2d(x)
-            
-        if self.resample_mode == 'downsample2d' or self.resample_mode == 'downsample3d':
-            # TODO: 稀疏计算的时候是不是不需要padding
-            x = self.downpad(x)
-
-            # if self.mode == "full":
-            #     pad = (0, 1, 0, 1) # 右边、下边补 1，保证 stride=2 时尺寸整齐（常见 trick)
-            #     x = F.pad(x, pad, mode="constant", value=0)
-           
-            x = self.gather2d(x)
-            x = self.conv(x)    # 2D卷积，通过stride=2下采样
-            x = self.scatter2d(x)
-        
+        x = self.resample(x)
         x = rearrange(x, '(b t) c h w -> b c t h w', t=t)
 
-
-        if self.resample_mode == 'downsample3d':
+        if self.mode == 'downsample3d':
             if feat_cache is not None:
                 idx = feat_idx[0]
                 if feat_cache[idx] is None:
                     feat_cache[idx] = x.clone()
                     feat_idx[0] += 1
                 else:
-                    # 先因果缓存，再gather，因为这个因果缓存要缓存整张图，而不是稀疏的部分
+
                     cache_x = x[:, :, -1:, :, :].clone()
+                    # if cache_x.shape[2] < CACHE_T and feat_cache[idx] is not None and feat_cache[idx]!='Rep':
+                    #     # cache last frame of last two chunk
+                    #     cache_x = torch.cat([feat_cache[idx][:, :, -1, :, :].unsqueeze(2).to(cache_x.device), cache_x], dim=2)
 
-                    x = self.gather3d(x)
-                    
-
-                    cache = feat_cache[idx][:, :, -1:, :, :]
-                    if not is_first_frame:
-                        cache = self.gather3d(cache)
-                    # x = self.time_conv(
-                    #     torch.cat([feat_cache[idx][:, :, -1:, :, :], x], 2))
-                    x = self.time_conv(torch.cat([cache, x], 2))
-                
+                    x = self.time_conv(
+                        torch.cat([feat_cache[idx][:, :, -1:, :, :], x], 2))
                     feat_cache[idx] = cache_x
                     feat_idx[0] += 1
-                    x = self.scatter3d(x)
         return x
 
     def init_weight(self, conv):
@@ -319,231 +212,43 @@ class Resample(SIGEModule3d):
         nn.init.zeros_(conv.bias.data)
 
 
-class ResidualBlock(SIGEModule3d):
-    def __init__(self, in_dim, out_dim, dropout=0.0, main_block_size=6, shortcut_block_size=4):
+class ResidualBlock(nn.Module):
+    def __init__(self, in_dim, out_dim, dropout=0.0):
         super().__init__()
         self.in_dim = in_dim
         self.out_dim = out_dim
 
         # layers
-        # self.residual = nn.Sequential(
-        #     RMS_norm(in_dim, images=False), nn.SiLU(),
-        #     CausalConv3d(in_dim, out_dim, 3, padding=1),
-        #     RMS_norm(out_dim, images=False), nn.SiLU(), nn.Dropout(dropout),
-        #     CausalConv3d(out_dim, out_dim, 3, padding=1))
-
-        # 1×1×1的卷积，不需要因果padding, padding:(0, 0, 0)
-        # self.shortcut = CausalConv3d(in_dim, out_dim, 1) \
-        #     if in_dim != out_dim else nn.Identity()
-
-
-        # 各个模块得分开写
-        self.norm1 = RMS_norm(in_dim, images=False)
-        self.conv1 = SIGECausalConv3d(in_dim, out_dim, 3, padding=1)
-
-        self.nonlinearity = nn.SiLU()
-        self.norm2 = RMS_norm(out_dim, images=False)
-        self.dropout = nn.Dropout(dropout)
-        self.conv2 = SIGECausalConv3d(out_dim, out_dim, 3, padding=1)
-
-        # TODO: silu -> identity, 因为time_gather中进行了激活值运算
-        self.main_gather = Gather3d(self.conv1, main_block_size, activation_name="identity")
-        self.scatter_gather = ScatterGather3d(self.main_gather, activation_name="identity")
-
-        if self.in_dim != self.out_dim:
-            self.shortcut = SIGECausalConv3d(in_dim, out_dim, kernel_size=1, stride=1, padding=0)
-            self.shortcut_gather = Gather3d(self.shortcut, shortcut_block_size)
-            self.scatter = ScatterWithBlockResidual3d(self.main_gather, self.shortcut_gather)
+        self.residual = nn.Sequential(
+            RMS_norm(in_dim, images=False), nn.SiLU(),
+            CausalConv3d(in_dim, out_dim, 3, padding=1),
+            RMS_norm(out_dim, images=False), nn.SiLU(), nn.Dropout(dropout),
+            CausalConv3d(out_dim, out_dim, 3, padding=1))
             
-        else:
-            self.scatter = Scatter3d(self.main_gather)
+        # shortcut是1×1×1的卷积，不需要看过去帧，也就不需要cache_pad
+        self.shortcut = CausalConv3d(in_dim, out_dim, 1) \
+            if in_dim != out_dim else nn.Identity()
 
-        # 因为我们对这个gather只是进行激活值计算，这是单点的，不需要和卷积一样向四周扩一圈
-        # self.conv_for_time_gather = nn.Conv3d(in_channels=1, out_channels=1, kernel_size=1, stride=1, padding=0)
-        conv_meta = Conv3dMeta(kernel_size=(1,1,1), stride=(1,1,1), padding=(0,0,0))
-        self.time_gather = Gather3d(conv_meta, block_size=1, activation_name="silu")
-        self.time_scatter = Scatter3d(self.time_gather)
-        self.time_scatter_2 = Scatter3d(self.time_gather)
+    def forward(self, x, feat_cache=None, feat_idx=[0]):
+        h = self.shortcut(x)
+        for layer in self.residual:
+            if isinstance(layer, CausalConv3d) and feat_cache is not None:
+                idx = feat_idx[0]
+                cache_x = x[:, :, -CACHE_T:, :, :].clone()
+                if cache_x.shape[2] < CACHE_T and feat_cache[idx] is not None:
+                    # cache last frame of last two chunk
+                    cache_x = torch.cat([
+                        feat_cache[idx][:, :, -1, :, :].unsqueeze(2).to(
+                            cache_x.device), cache_x
+                    ],
+                        dim=2)
+                x = layer(x, feat_cache[idx])
+                feat_cache[idx] = cache_x
+                feat_idx[0] += 1
+            else:
+                x = layer(x)
+        return x + h
 
-
-    def full_forward(self, x, feat_cache=None, feat_idx=[0], is_first_frame=False):
-        h = x
-        if self.in_dim != self.out_dim:
-            if not is_first_frame:
-                h = self.shortcut_gather(h)
-            h = self.shortcut(h)
-
-
-        if not is_first_frame:
-            x = self.time_gather(x) # activation_name="silu"
-
-        x, scale1 = self.norm1(x, return_inv_norm=True)
-        self.scale1 = scale1
-        # full状态下不会进入算子，所以不会进行激活值计算
-        x = self.nonlinearity(x)
-        
-        if not is_first_frame:
-            x = self.time_scatter(x)
-
-
-        # 先因果缓存，再gather，因为这个因果缓存要缓存整张图，而不是稀疏的部分
-        cache_x = x[:, :, -CACHE_T:, :, :].clone()
-
-        # x = self.main_gather(x, self.scale1, self.shift1)
-        if not is_first_frame:
-            x = self.main_gather(x)
-
-        # 对conv特殊处理
-        idx = feat_idx[0]
-        if cache_x.shape[2] < CACHE_T and feat_cache[idx] is not None:
-            # cache last frame of last two chunk
-            cache_x = torch.cat([
-                feat_cache[idx][:, :, -1, :, :].unsqueeze(2).to(
-                    cache_x.device), cache_x
-            ],
-                dim=2)
-
-        if not is_first_frame:
-            cache = self.main_gather(feat_cache[idx])
-        else:
-            cache = feat_cache[idx]
-        x = self.conv1(x, cache)
-        feat_cache[idx] = cache_x
-        feat_idx[0] += 1
-
-
-
-
-        # x = self.scatter_gather(h, self.scale2, self.shift2)
-        if not is_first_frame:
-            x = self.scatter_gather(x)
-
-        # 对conv特殊处理
-        idx = feat_idx[0]
-        # 不能这么写，因为此时x是稀疏的，我们需要全图的
-        # 所以去scatter_gather的original_outputs中去取（备注：需要被设置为sparse_update）
-        # cache_x = x[:, :, -CACHE_T:, :, :].clone()
-        # TODO: 确认cache_id是不是一直为0，如果是，就删除
-        # TODO: 这样也不对，因为sparse部分没有进行norm和silu
-
-        if not is_first_frame:
-            cache_x = self.scatter_gather.original_outputs[0][:, :, -CACHE_T:, :, :].clone()
-            cache_x = self.time_gather(cache_x) # activation_name="silu"
-            cache_x, scale2 = self.norm2(cache_x, return_inv_norm=True)
-            self.scale2 = scale2
-            cache_x = self.nonlinearity(cache_x)
-            cache_x = self.time_scatter_2(cache_x)
-
-
-        x, scale2 = self.norm2(x, return_inv_norm=True)
-        self.scale2 = scale2
-        x = self.nonlinearity(x)
-        cache_x = x[:, :, -CACHE_T:, :, :].clone()
-        if cache_x.shape[2] < CACHE_T and feat_cache[idx] is not None:
-            # cache last frame of last two chunk
-            cache_x = torch.cat([
-                feat_cache[idx][:, :, -1, :, :].unsqueeze(2).to(
-                    cache_x.device), cache_x
-            ],
-                dim=2)
-
-        # TODO:如何处理第二个耦合的gather呢, 复用第一次的gather可以吗?
-        if not is_first_frame:
-            cache = self.main_gather(feat_cache[idx])
-        else:
-            cache = feat_cache[idx]
-        x = self.conv2(x, cache)
-        feat_cache[idx] = cache_x
-        feat_idx[0] += 1
-
-        if not is_first_frame:
-            x = self.scatter(x, h)
-        # x shape:
-        # no sparse: [1, 128, 512, 1024], self.scatter = Scatter3d
-        # sparse: [405, 256, 4, 4]), self.scatter = ScatterWithBlockResidual3d
-              
-        return x
-    
-    def sparse_forward(self, x, feat_cache=None, feat_idx=[0]):
-        h = x
-        if self.in_dim != self.out_dim:
-            h = self.shortcut_gather(h)
-            h = self.shortcut(h)
-
-        # TODO: RMS_norm 如何进行normalize呢
-        # 先norm，再激活
-
-
-        x = self.time_gather(x, self.scale1)    # activation_name="silu"
-        x = self.time_scatter(x)
-
-        # 先因果缓存，再gather，因为这个因果缓存要缓存整张图，而不是稀疏的部分
-        cache_x = x[:, :, -CACHE_T:, :, :].clone()
-
-        x = self.main_gather(x)
-
-        # 对conv特殊处理
-        idx = feat_idx[0]
-        if cache_x.shape[2] < CACHE_T and feat_cache[idx] is not None:
-            # cache last frame of last two chunk
-            cache_x = torch.cat([
-                feat_cache[idx][:, :, -1, :, :].unsqueeze(2).to(
-                    cache_x.device), cache_x
-            ],
-                dim=2)
-
-        cache = self.main_gather(feat_cache[idx])
-        x = self.conv1(x, cache)
-        feat_cache[idx] = cache_x
-        feat_idx[0] += 1
-
-
-        # x = self.scatter_gather(h, self.scale2, self.shift2)
-        x = self.scatter_gather(x, self.scale2)
-
-        idx = feat_idx[0]
-
-        # TODO: 确认cache_id是不是一直为0，如果是，就删除
-
-        # TODO: 这样也不对，因为sparse部分没有进行norm和silu
-        cache_x = self.scatter_gather.original_outputs[0][:, :, -CACHE_T:, :, :].clone()
-        cache_x = self.time_gather(cache_x, self.scale2[:, :, -CACHE_T:, :, :])    # activation_name="silu"
-        cache_x = self.time_scatter_2(cache_x)
-
-
-        if cache_x.shape[2] < CACHE_T and feat_cache[idx] is not None:
-            # cache last frame of last two chunk
-            cache_x = torch.cat([
-                feat_cache[idx][:, :, -1, :, :].unsqueeze(2).to(
-                    cache_x.device), cache_x
-            ],
-                dim=2)
-
-        # TODO:如何处理第二个耦合的gather呢, 复用第一次的gather可以吗?
-        cache = self.main_gather(feat_cache[idx])
-
-        x = self.conv2(x, cache)
-        feat_cache[idx] = cache_x
-        feat_idx[0] += 1
-
-
-        x = self.scatter(x, h)
-        # x shape:
-        # no sparse: [1, 128, 512, 1024], self.scatter = Scatter3d
-        # sparse: [405, 256, 4, 4]), self.scatter = ScatterWithBlockResidual3d
-        
-        return x
-    
-    def forward(self, x, feat_cache=None, feat_idx=[0], is_first_frame=False):
-        # 第一帧算作full状态
-        if self.mode == "full":
-            return self.full_forward(x, feat_cache, feat_idx, is_first_frame)
-        elif self.mode in ("sparse", "profile"):
-            return self.sparse_forward(x, feat_cache, feat_idx)
-        else:
-            raise NotImplementedError("Unknown mode [%s]!!!" % self.mode)
-
-        
 
 class AttentionBlock(nn.Module):
     """
@@ -587,7 +292,8 @@ class AttentionBlock(nn.Module):
         return x + identity
 
 
-class Encoder3d(SIGEModel3d):
+class Encoder3d(nn.Module):
+
     def __init__(self,
                  dim=128,
                  z_dim=4,
@@ -609,7 +315,6 @@ class Encoder3d(SIGEModel3d):
         scale = 1.0
 
         # init block
-        # 不进行稀疏计算
         self.conv1 = CausalConv3d(3, dims[0], 3, padding=1)
 
         # downsample blocks
@@ -624,26 +329,23 @@ class Encoder3d(SIGEModel3d):
 
             # downsample block
             if i != len(dim_mult) - 1:
-                mode = 'downsample3d' if temperal_downsample[i] else 'downsample2d'
-                downsamples.append(Resample(out_dim, resample_mode=mode))
+                mode = 'downsample3d' if temperal_downsample[
+                    i] else 'downsample2d'
+                downsamples.append(Resample(out_dim, mode=mode))
                 scale /= 2.0
         self.downsamples = nn.Sequential(*downsamples)
 
         # middle blocks
         self.middle = nn.Sequential(
-            ResidualBlock(out_dim, out_dim, dropout),
-            AttentionBlock(out_dim),
+            ResidualBlock(out_dim, out_dim, dropout), AttentionBlock(out_dim),
             ResidualBlock(out_dim, out_dim, dropout))
 
         # output blocks
         self.head = nn.Sequential(
             RMS_norm(out_dim, images=False), nn.SiLU(),
-            # 不进行稀疏计算
             CausalConv3d(out_dim, z_dim, 3, padding=1))
 
-
-    def forward(self, x, feat_cache=None, feat_idx=[0], is_first_frame=False):
-        # 针对conv1的, 不进行稀疏计算
+    def forward(self, x, feat_cache=None, feat_idx=[0]):
         if feat_cache is not None:
             idx = feat_idx[0]
             cache_x = x[:, :, -CACHE_T:, :, :].clone()
@@ -663,19 +365,18 @@ class Encoder3d(SIGEModel3d):
         # downsamples
         for layer in self.downsamples:
             if feat_cache is not None:
-                x = layer(x, feat_cache, feat_idx, is_first_frame)
+                x = layer(x, feat_cache, feat_idx)
             else:
                 x = layer(x)
 
         # middle
         for layer in self.middle:
             if isinstance(layer, ResidualBlock) and feat_cache is not None:
-                x = layer(x, feat_cache, feat_idx, is_first_frame)
+                x = layer(x, feat_cache, feat_idx)
             else:
                 x = layer(x)
 
         # head
-        # 针对head中的conv, 不进行稀疏计算
         for layer in self.head:
             if isinstance(layer, CausalConv3d) and feat_cache is not None:
                 idx = feat_idx[0]
@@ -695,7 +396,8 @@ class Encoder3d(SIGEModel3d):
         return x
 
 
-class Decoder3d(SIGEModel3d):
+class Decoder3d(nn.Module):
+
     def __init__(self,
                  dim=128,
                  z_dim=4,
@@ -717,13 +419,11 @@ class Decoder3d(SIGEModel3d):
         scale = 1.0 / 2**(len(dim_mult) - 2)
 
         # init block
-        # 不进行稀疏计算
         self.conv1 = CausalConv3d(z_dim, dims[0], 3, padding=1)
 
         # middle blocks
         self.middle = nn.Sequential(
-            ResidualBlock(dims[0], dims[0], dropout), 
-            AttentionBlock(dims[0]),
+            ResidualBlock(dims[0], dims[0], dropout), AttentionBlock(dims[0]),
             ResidualBlock(dims[0], dims[0], dropout))
 
         # upsample blocks
@@ -741,17 +441,16 @@ class Decoder3d(SIGEModel3d):
             # upsample block
             if i != len(dim_mult) - 1:
                 mode = 'upsample3d' if temperal_upsample[i] else 'upsample2d'
-                upsamples.append(Resample(out_dim, resample_mode=mode))
+                upsamples.append(Resample(out_dim, mode=mode))
                 scale *= 2.0
         self.upsamples = nn.Sequential(*upsamples)
 
         # output blocks
         self.head = nn.Sequential(
             RMS_norm(out_dim, images=False), nn.SiLU(),
-            # 不进行稀疏计算
             CausalConv3d(out_dim, 3, 3, padding=1))
 
-    def forward(self, x, feat_cache=None, feat_idx=[0], is_first_frame=False):
+    def forward(self, x, feat_cache=None, feat_idx=[0]):
         # conv1
         if feat_cache is not None:
             idx = feat_idx[0]
@@ -772,14 +471,14 @@ class Decoder3d(SIGEModel3d):
         # middle
         for layer in self.middle:
             if isinstance(layer, ResidualBlock) and feat_cache is not None:
-                x = layer(x, feat_cache, feat_idx, is_first_frame)
+                x = layer(x, feat_cache, feat_idx)
             else:
                 x = layer(x)
 
         # upsamples
         for layer in self.upsamples:
             if feat_cache is not None:
-                x = layer(x, feat_cache, feat_idx, is_first_frame)
+                x = layer(x, feat_cache, feat_idx)
             else:
                 x = layer(x)
 
@@ -806,26 +505,10 @@ class Decoder3d(SIGEModel3d):
 def count_conv3d(model):
     count = 0
     for m in model.modules():
-        if isinstance(m, (CausalConv3d, SIGECausalConv3d)):
+        if isinstance(m, CausalConv3d):
             count += 1
     return count
 
-def dump_scatter_cache(model, tag=""):
-    total = 0.0
-    print(f"\n==== Scatter original_outputs {tag} ====")
-    for name, m in model.named_modules():
-        if hasattr(m, "original_outputs"):
-            d = getattr(m, "original_outputs", {})
-            mb = 0.0
-            n = 0
-            for v in d.values():
-                if torch.is_tensor(v):
-                    n += 1
-                    mb += v.element_size() * v.nelement() / 1024**2
-            if n > 0:
-                print(f"{name}: entries={n}, {mb:.1f} MB")
-            total += mb
-    print(f"TOTAL Scatter cache: {total:.1f} MB")
 
 class WanVAE_(nn.Module):
 
@@ -849,7 +532,6 @@ class WanVAE_(nn.Module):
         # modules
         self.encoder = Encoder3d(dim, z_dim * 2, dim_mult, num_res_blocks,
                                  attn_scales, self.temperal_downsample, dropout)
-        # 这两个也不稀疏计算
         self.conv1 = CausalConv3d(z_dim * 2, z_dim * 2, 1)
         self.conv2 = CausalConv3d(z_dim, z_dim, 1)
         self.decoder = Decoder3d(dim, z_dim, dim_mult, num_res_blocks,
@@ -893,10 +575,9 @@ class WanVAE_(nn.Module):
         self.clear_cache()
         return mu
 
-    def stream_encode(self, x, scale, mask=None, flow=None):
+    def stream_encode(self, x, scale):
         # self.clear_cache()
         # cache
-        # TODO: 看看如何使用mask和flow
         t = x.shape[2]
         if self.first_encode:
             self.first_encode = False
@@ -906,36 +587,17 @@ class WanVAE_(nn.Module):
                 x[:, :, :1, :, :],
                 feat_cache=self._enc_feat_map,
                 feat_idx=self._enc_conv_idx,
-                is_first_frame=True,
                 )
             self._enc_conv_idx = [0]
-
-            # 第一次只cache，没有flow的映射和mask
-            self.encoder.set_mode("full")
-            # dump_scatter_cache(self.encoder, "after t=1")  
-
             out_ = self.encoder(
                 x[:, :, 1:, :, :],
                 feat_cache=self._enc_feat_map,
                 feat_idx=self._enc_conv_idx,
                 )
             out = torch.cat([out, out_], 2)
-            # dump_scatter_cache(self.encoder, "after t=4")   
-
         else:
-            # set_maks
-            # 通过光流/运动向量映射来改变scatter's的original_outputs
-            self.encoder.set_mode("sparse")
-
             out=[]
             for i in range(t//4):
-                # TODO: 下面传入的mask，是当前chunk相对于上一个chunk，计算得到的，flow也是
-                # 测试的时候mask, flow取得固定值
-                self.encoder.set_masks(mask)
-                self.encoder.flow_cache(flow)
-                # 每次稀疏计算之后，把结果写回原图进行覆盖
-                self.encoder.set_sparse_update(True)
-
                 self._enc_conv_idx = [0]
                 out.append(self.encoder(
                     x[:, :, i*4:(i+1)*4, :, :],
@@ -979,7 +641,7 @@ class WanVAE_(nn.Module):
         self.clear_cache()
         return out
 
-    def stream_decode(self, z, scale, mask=None, flow=None):
+    def stream_decode(self, z, scale):
         # z: [b,c,t,h,w]
         t = z.shape[2]
         if isinstance(scale[0], torch.Tensor):
@@ -997,13 +659,8 @@ class WanVAE_(nn.Module):
                 x[:, :, :1, :, :],
                 feat_cache=self._feat_map,
                 feat_idx=self._conv_idx,
-                is_first_frame=True,
                 )
             self._conv_idx = [0]
-
-            # 第一次只cache，没有flow的映射和mask
-            self.encoder.set_mode("full")
-            
             out_ = self.decoder(
                 x[:, :, 1:, :, :],
                 feat_cache=self._feat_map,
@@ -1011,19 +668,8 @@ class WanVAE_(nn.Module):
                 )
             out = torch.cat([out, out_], 2)
         else:
-            # set_maks
-            # change scatter's original_outputs through flow
-            self.encoder.set_mode("sparse")
-
             out = []
             for i in range(t):
-                # TODO: 下面传入的mask，是当前chunk相对于上一个chunk，计算得到的，flow也是
-                # 测试的时候mask, flow取得固定值
-                self.encoder.set_masks(mask)
-                self.encoder.flow_cache(flow)
-                # 每次稀疏计算之后，把结果写回原图进行覆盖
-                self.encoder.set_sparse_update(True)
-
                 self._conv_idx = [0]
                 out.append(self.decoder(
                     x[:, :, i:(i+1), :, :],
@@ -1064,60 +710,7 @@ class WanVAE_(nn.Module):
         self._enc_conv_num = count_conv3d(self.encoder)
         self._enc_conv_idx = [0]
         self._enc_feat_map = [None] * self._enc_conv_num
-
-import re
-from collections import OrderedDict
-
-def map_wanvae_ckpt_keys(sd: dict) -> dict:
-    """
-    1) ResidualBlock:  ...residual.{0,2,3,6}.{gamma,weight,bias}  -> ...{norm1,conv1,norm2,conv2}.{...}
-    2) Resample:      ...resample.1.{weight,bias}                -> ...conv.{weight,bias}
-
-    不改原 sd，返回新的 OrderedDict，可用于 strict=True。
-    """
-    out = OrderedDict()
-
-    # ---- 1) residual Sequential -> flat modules ----
-    residual_map = {
-        0: "norm1",  # RMS_norm(in_dim)
-        2: "conv1",  # CausalConv3d(in_dim -> out_dim)
-        3: "norm2",  # RMS_norm(out_dim)
-        6: "conv2",  # CausalConv3d(out_dim -> out_dim)
-        # 1/4/5 (SiLU/SiLU/Dropout) 理论上无参数
-    }
-    pat_residual = re.compile(r"^(.*)\.residual\.(\d+)\.(weight|bias|gamma)$")
-
-    # ---- 2) resample Sequential conv -> your conv ----
-    # checkpoint: encoder.downsamples.2.resample.1.weight
-    # your model: encoder.downsamples.2.conv.weight
-    pat_resample = re.compile(r"^(.*)\.resample\.1\.(weight|bias)$")
-
-    for k, v in sd.items():
-        # resample first (更具体)
-        m2 = pat_resample.match(k)
-        if m2:
-            prefix, param = m2.group(1), m2.group(2)
-            new_k = f"{prefix}.conv.{param}"
-            out[new_k] = v
-            continue
-
-        # residual
-        m1 = pat_residual.match(k)
-        if m1:
-            prefix, idx_str, param = m1.group(1), m1.group(2), m1.group(3)
-            idx = int(idx_str)
-            if idx in residual_map:
-                new_k = f"{prefix}.{residual_map[idx]}.{param}"
-                out[new_k] = v
-            else:
-                # 理论上不会出现（SiLU/Dropout无参数），保留原样以便排查
-                out[k] = v
-            continue
-
-        # default passthrough
-        out[k] = v
-
-    return out
+    
 
 
 def _video_vae(pretrained_path=None, z_dim=None, device='cpu', **kwargs):
@@ -1143,20 +736,8 @@ def _video_vae(pretrained_path=None, z_dim=None, device='cpu', **kwargs):
     logging.info(f'loading {pretrained_path}')
 
     # 用mmap加速
-    raw_sd = torch.load(pretrained_path, map_location=device, mmap=True)
-
-    mapped_sd = map_wanvae_ckpt_keys(raw_sd)
-
-    model.load_state_dict(mapped_sd, assign=True)
-    
-    print("*" * 40)
-    print("Load Model Weight Successfully!!!")
-    print("*" * 40)
-
-
-    # 用mmap加速
-    # model.load_state_dict(
-    #     torch.load(pretrained_path, map_location=device, mmap=True), assign=True)
+    model.load_state_dict(
+        torch.load(pretrained_path, map_location=device, mmap=True), assign=True)
 
     return model
 
@@ -1263,20 +844,22 @@ class WanVAEWrapper(VAEInterface):
         return output
     
     # 调用入口
-    def stream_encode(self, video: torch.Tensor, mask=None, flow=None) -> torch.Tensor:
-        device, dtype = video.device, video.dtype
-        scale = [self.mean.to(device=device, dtype=dtype),
+    def stream_encode(self, video: torch.Tensor, is_scale=True) -> torch.Tensor:
+        if is_scale:
+            device, dtype = video.device, video.dtype
+            scale = [self.mean.to(device=device, dtype=dtype),
                     1.0 / self.std.to(device=device, dtype=dtype)]
-
-        return self.model.stream_encode(video, scale, mask, flow)
+        else:
+            scale = None
+        return self.model.stream_encode(video, scale)
     
-    def stream_decode_to_pixel(self, latent: torch.Tensor, mask=None, flow=None) -> torch.Tensor:
+    def stream_decode_to_pixel(self, latent: torch.Tensor) -> torch.Tensor:
         zs = latent.permute(0, 2, 1, 3, 4)
         zs = zs.to(torch.bfloat16).to('cuda')
         device, dtype = latent.device, latent.dtype
         scale = [self.mean.to(device=device, dtype=dtype),
                  1.0 / self.std.to(device=device, dtype=dtype)]
-        output = self.model.stream_decode(zs, scale, mask, flow).float().clamp_(-1, 1)
+        output = self.model.stream_decode(zs, scale).float().clamp_(-1, 1)
         output = output.permute(0, 2, 1, 3, 4)
         return output
 
@@ -1329,81 +912,25 @@ def psnr_np(x, y, max_val=255.0):
         return float("inf")
     return 10.0 * np.log10((max_val ** 2) / mse)
 
-def _parse_args(argv=None):
-    parser = argparse.ArgumentParser()
-    parser.add_argument(
-        "-i",
-        "--video",
-        default="assets/input.mp4",
-        help="Input video path (mp4).",
-    )
-    parser.add_argument(
-        "-o",
-        "--out",
-        default="assets/output.mp4",
-        help="Output video path (mp4).",
-    )
-    parser.add_argument(
-        "--resize-hw",
-        nargs=2,
-        type=int,
-        default=(480, 832),
-        metavar=("H", "W"),
-        help="Resize input frames to H W before encoding/decoding.",
-    )
-    parser.add_argument(
-        "--max-frames",
-        type=int,
-        default=None,
-        help="Optionally truncate to first N frames.",
-    )
-    parser.add_argument(
-        "--device",
-        default=None,
-        help='Torch device string, e.g. "cuda:0" or "cpu" (default: auto).',
-    )
-    return parser.parse_args(argv)
-
-
 @torch.no_grad()
-def main(argv=None):
-    args = _parse_args(argv)
-
-    device_str = args.device or ("cuda:0" if torch.cuda.is_available() else "cpu")
-    device = torch.device(device_str)
+def main():
+    device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
     dtype = torch.bfloat16
     vae = WanVAEWrapper().to(device=device, dtype=dtype)
 
-    video_path = args.video
-    out_path = args.out
+    video_path = "assets/input.mp4"
+    out_path = "assets/recon.mp4"
 
-    input_video_original, original_fps = load_mp4_as_tensor(
-        video_path, max_frames=args.max_frames, resize_hw=tuple(args.resize_hw)
-    )
+    input_video_original, original_fps = load_mp4_as_tensor(video_path, resize_hw=(480, 832))
     input_video_original = input_video_original.unsqueeze(0).to(device=device, dtype=dtype)
 
-
-    flow_np = np.load("assets/flow.npy")    # (H, W, 2), float32
-    mask_np = np.load("assets/mask.npy")    # (H, W), uint8
-
-    flow = torch.from_numpy(flow_np)   # torch.float32
-    mask = torch.from_numpy(mask_np)   # torch.uint8
-
-    # Encoder masks
-    mask_enc = dilate_mask(mask, 5)
-    masks_enc = downsample_mask(mask_enc, min_res=(4, 4), dilation=1)
-
-    # Decoder masks
-    mask_dec = dilate_mask(mask, 40)
-    masks_dec = downsample_mask(mask_dec, min_res=(4, 4), dilation=0)
-
-
     recon_video_list = []
+
     # ---- 5,4,4,... 分块 encode ----
     for i, chunk in enumerate(iter_5_4_4_chunks(input_video_original)):
-        lat = vae.stream_encode(chunk, mask=masks_enc, flow=flow)          # 逐块喂进去
+        lat = vae.stream_encode(chunk)          # 逐块喂进去
         lat = lat.permute(0, 2, 1, 3, 4)
-        video = vae.stream_decode_to_pixel(lat, mask=masks_dec, flow=flow)
+        video = vae.stream_decode_to_pixel(lat)
         recon_video_list.append(video)
         print(f"[Chunk {i}] done!!!")
 
@@ -1428,11 +955,4 @@ def main(argv=None):
 
 
 if __name__ == "__main__":
-    torch.cuda.reset_peak_memory_stats()
     main()
-    torch.cuda.synchronize()
-    print(
-        "Peak GPU memory:",
-        torch.cuda.max_memory_allocated() / 1024**3,
-        "GB"
-    )
