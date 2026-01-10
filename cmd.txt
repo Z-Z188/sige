@@ -1,0 +1,21 @@
+# 测试性能的
+python run.py --task sdedit \
+--prompt "A fantasy beach landscape, trending on artstation" \
+--init_img assets/img2img/original/1.png \
+--edited_img assets/img2img/edited/1.png --seed 95 \
+--config_path configs/sige.yaml --mode profile_unet \
+--use-torch-kernel
+
+# 产生结果的
+python run.py --task sdedit \
+--prompt "A fantasy beach landscape, trending on artstation" \
+--output_path img2img-sige1.png \
+--init_img assets/img2img/original/1.png \
+--edited_img assets/img2img/edited/1.png --seed 95 \
+--config_path configs/sige.yaml
+--use-torch-kernel
+
+
+python example.py --use-runtime 
+
+

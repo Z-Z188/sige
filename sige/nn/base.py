@@ -12,7 +12,7 @@ class SIGEModule(nn.Module):
         if call_super:
             super(SIGEModule, self).__init__()
         self.devices: List[str] = ["cpu", "cuda", "mps"]
-        self.supported_dtypes = [torch.float32]
+        self.supported_dtypes = [torch.float32, torch.bfloat16]
         self.mode: str = "full"
         self.runtime: Dict = {}
         self.mask: Optional[torch.Tensor] = None
