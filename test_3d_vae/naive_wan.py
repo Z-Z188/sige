@@ -91,31 +91,30 @@ class Upsample(nn.Upsample):
 
 
 class Resample(nn.Module):
-
-    def __init__(self, dim, mode):
-        assert mode in ('none', 'upsample2d', 'upsample3d', 'downsample2d',
+    def __init__(self, dim, resample_mode):
+        assert resample_mode in ('none', 'upsample2d', 'upsample3d', 'downsample2d',
                         'downsample3d')
         super().__init__()
         self.dim = dim
-        self.mode = mode
+        self.resample_mode = resample_mode
 
         # layers
-        if mode == 'upsample2d':
+        if resample_mode == 'upsample2d':
             self.resample = nn.Sequential(
                 Upsample(scale_factor=(2., 2.), mode='nearest-exact'),
                 nn.Conv2d(dim, dim // 2, 3, padding=1))
-        elif mode == 'upsample3d':
+        elif resample_mode == 'upsample3d':
             self.resample = nn.Sequential(
                 Upsample(scale_factor=(2., 2.), mode='nearest-exact'),
                 nn.Conv2d(dim, dim // 2, 3, padding=1))
             self.time_conv = CausalConv3d(
                 dim, dim * 2, (3, 1, 1), padding=(1, 0, 0))
 
-        elif mode == 'downsample2d':
+        elif resample_mode == 'downsample2d':
             self.resample = nn.Sequential(
                 nn.ZeroPad2d((0, 1, 0, 1)), # 右边、下边补 1，保证 stride=2 时尺寸整齐（常见 trick
                 nn.Conv2d(dim, dim, 3, stride=(2, 2)))
-        elif mode == 'downsample3d':
+        elif resample_mode == 'downsample3d':
             self.resample = nn.Sequential(
                 nn.ZeroPad2d((0, 1, 0, 1)),
                 nn.Conv2d(dim, dim, 3, stride=(2, 2)))
@@ -125,9 +124,9 @@ class Resample(nn.Module):
         else:
             self.resample = nn.Identity()
 
-    def forward(self, x, feat_cache=None, feat_idx=[0]):
+    def forward(self, x, feat_cache=None, feat_idx=[0], is_first_frame=False):
         b, c, t, h, w = x.size()
-        if self.mode == 'upsample3d':
+        if self.resample_mode == 'upsample3d':
             if feat_cache is not None:
                 idx = feat_idx[0]
                 if feat_cache[idx] is None:
@@ -141,13 +140,6 @@ class Resample(nn.Module):
                         cache_x = torch.cat([
                             feat_cache[idx][:, :, -1, :, :].unsqueeze(2).to(
                                 cache_x.device), cache_x
-                        ],
-                            dim=2)
-                    if cache_x.shape[2] < CACHE_T and feat_cache[
-                            idx] is not None and feat_cache[idx] == 'Rep':
-                        cache_x = torch.cat([
-                            torch.zeros_like(cache_x).to(cache_x.device),
-                            cache_x
                         ],
                             dim=2)
                     if feat_cache[idx] == 'Rep':
@@ -169,7 +161,7 @@ class Resample(nn.Module):
         x = self.resample(x)
         x = rearrange(x, '(b t) c h w -> b c t h w', t=t)
 
-        if self.mode == 'downsample3d':
+        if self.resample_mode == 'downsample3d':
             if feat_cache is not None:
                 idx = feat_idx[0]
                 if feat_cache[idx] is None:

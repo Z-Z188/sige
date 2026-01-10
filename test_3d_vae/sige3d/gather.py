@@ -20,6 +20,7 @@ class Gather3d(SIGEModule3d):
         activation_name: str = "identity",
         activation_first: bool = False,
         verbose: bool = False,
+        rms_norm: Optional[nn.Module] = None,   # ✅ 新增
     ):
         super().__init__()
 
@@ -63,9 +64,21 @@ class Gather3d(SIGEModule3d):
         self.input_res: Optional[Tuple[int, int]] = None
         self.active_indices: Optional[torch.Tensor] = None
 
+        # rms_norm: Optional[nn.Module]
+        if rms_norm is not None:
+            self.rms_norm_fn = rms_norm.forward   # ✅ 只存函数
+        else:
+            self.rms_norm_fn = None
+
+
     def forward(
-        self, x: torch.Tensor, scale: Optional[torch.Tensor] = None, shift: Optional[torch.Tensor] = None
+        self,
+        x: torch.Tensor,
+        scale: Optional[torch.Tensor] = None,
+        shift: Optional[torch.Tensor] = None,
+        is_cache_gather: Optional[bool] = False,
     ) -> torch.Tensor:
+
         self.check_dtype(x, scale, shift)
         self.check_dim(x, scale, shift)
         b, c, t, _, _ = x.shape
@@ -107,6 +120,8 @@ class Gather3d(SIGEModule3d):
                 None if shift is None else shift.contiguous(),
                 self.activation_name,
                 self.activation_first,
+                rms_norm_fn=self.rms_norm_fn,   # ✅ 改名，传函数
+                is_cache_gather=is_cache_gather # 不需要norm和激活    
             )
 
         raise NotImplementedError(f"Unknown mode: {self.mode}")

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import torch
 import torch.nn.functional as F
+from torch.autograd.profiler import record_function
 
 
 def _as_flow_hw2(flow: torch.Tensor) -> torch.Tensor:
@@ -58,30 +59,38 @@ def forward_warp_cache_5d(cache: torch.Tensor, flow: torch.Tensor) -> torch.Tens
     - flow:  (H, W, 2) / (2, H, W) / (1, 2, H, W), (dx, dy) in pixel units
     - output: same shape, output[..., y, x] samples input at (x+dx, y+dy)
     """
-    if cache.dim() != 5:
-        raise ValueError(f"cache must be 5D (B,C,T,H,W); got {tuple(cache.shape)}")
-    b, c, t, h, w = cache.shape
+    with record_function("sige3d::forward_warp_cache_5d"):
+        if cache.dim() != 5:
+            raise ValueError(f"cache must be 5D (B,C,T,H,W); got {tuple(cache.shape)}")
+        b, c, t, h, w = cache.shape
 
-    flow = normalize_flow(flow, int(h), int(w), device=cache.device)
+        flow = normalize_flow(flow, int(h), int(w), device=cache.device)
 
-    # Base grid in pixel coords: (x,y) with x in [0,w-1], y in [0,h-1].
-    y = torch.arange(h, device=cache.device, dtype=torch.float32).view(h, 1)
-    x = torch.arange(w, device=cache.device, dtype=torch.float32).view(1, w)
-    base_x = x.expand(h, w)
-    base_y = y.expand(h, w)
+        # Base grid in pixel coords: (x,y) with x in [0,w-1], y in [0,h-1].
+        y = torch.arange(h, device=cache.device, dtype=torch.float32).view(h, 1)
+        x = torch.arange(w, device=cache.device, dtype=torch.float32).view(1, w)
+        base_x = x.expand(h, w)
+        base_y = y.expand(h, w)
 
-    sample_x = base_x + flow[..., 0]
-    sample_y = base_y + flow[..., 1]
+        sample_x = base_x + flow[..., 0]
+        sample_y = base_y + flow[..., 1]
 
-    # Normalize to [-1, 1] for grid_sample (align_corners=True).
-    w_denom = float(max(w - 1, 1))
-    h_denom = float(max(h - 1, 1))
-    x_grid = 2.0 * sample_x / w_denom - 1.0
-    y_grid = 2.0 * sample_y / h_denom - 1.0
-    grid = torch.stack([x_grid, y_grid], dim=-1)  # (H,W,2)
+        # Normalize to [-1, 1] for grid_sample (align_corners=True).
+        w_denom = float(max(w - 1, 1))
+        h_denom = float(max(h - 1, 1))
+        x_grid = 2.0 * sample_x / w_denom - 1.0
+        y_grid = 2.0 * sample_y / h_denom - 1.0
+        grid = torch.stack([x_grid, y_grid], dim=-1)  # (H,W,2)
 
-    # Warp each time slice independently with the same spatial grid.
-    cache_2d = cache.permute(0, 2, 1, 3, 4).contiguous().view(b * t, c, h, w)
-    grid_bt = grid.unsqueeze(0).expand(b * t, h, w, 2).to(dtype=cache_2d.dtype)
-    warped = F.grid_sample(cache_2d, grid_bt, mode="bilinear", padding_mode="zeros", align_corners=True)
-    return warped.view(b, t, c, h, w).permute(0, 2, 1, 3, 4).contiguous()
+        # Warp each time slice independently with the same spatial grid.
+        cache_2d = cache.permute(0, 2, 1, 3, 4).contiguous().view(b * t, c, h, w)
+        grid_bt = grid.unsqueeze(0).expand(b * t, h, w, 2).to(dtype=cache_2d.dtype)
+        with record_function("sige3d::forward_warp_cache_5d::grid_sample"):
+            warped = F.grid_sample(
+                cache_2d,
+                grid_bt,
+                mode="bilinear",
+                padding_mode="zeros",
+                align_corners=True,
+            )
+        return warped.view(b, t, c, h, w).permute(0, 2, 1, 3, 4).contiguous()

@@ -10,6 +10,11 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
+try:
+    from sige.nn import SIGEModule as SIGEModule2d
+except Exception:
+    SIGEModule2d = None
+
 
 class SIGEModule3d(nn.Module):
     def __init__(self, call_super: bool = True):
@@ -79,17 +84,23 @@ class SIGEModel3d(nn.Module):
         for module in self.modules():
             if isinstance(module, SIGEModule3d):
                 module.set_mask(masks, cache, self.timestamp)
+            if SIGEModule2d is not None and isinstance(module, SIGEModule2d):
+                module.set_mask(masks, cache, self.timestamp)
 
     def set_mode(self, mode: str):
         self.mode = mode
         for module in self.modules():
             if isinstance(module, SIGEModule3d):
                 module.set_mode(mode)
+            if SIGEModule2d is not None and isinstance(module, SIGEModule2d):
+                module.set_mode(mode)
     
 
     def clear_cache(self):
         for module in self.modules():
             if isinstance(module, SIGEModule3d):
+                module.clear_cache()
+            if SIGEModule2d is not None and isinstance(module, SIGEModule2d):
                 module.clear_cache()
 
     def clear_stream_cache(self):
@@ -101,10 +112,14 @@ class SIGEModel3d(nn.Module):
         for module in self.modules():
             if isinstance(module, SIGEModule3d):
                 module.set_cache_id(cache_id)
+            if SIGEModule2d is not None and isinstance(module, SIGEModule2d):
+                module.set_cache_id(cache_id)
 
     def set_sparse_update(self, sparse_update: bool):
         for module in self.modules():
             if isinstance(module, SIGEModule3d):
+                module.set_sparse_update(sparse_update)
+            if SIGEModule2d is not None and isinstance(module, SIGEModule2d):
                 module.set_sparse_update(sparse_update)
 
     def flow_cache(self, flow):
@@ -126,6 +141,9 @@ class SIGECausalConv3d(nn.Conv3d, SIGEModule3d):
 
         # 原始 conv3d 的 padding (T,H,W)
         p_t, p_h, p_w = self.padding
+        
+        # 供 Gather3d 推断 spatial offset（等价于原始 padding(H,W)）
+        self.spatial_padding = (int(p_h), int(p_w))
 
         # spatial pad for F.pad order: (Wl, Wr, Hl, Hr, Tl, Tr)
         self._spatial_pad = (p_w, p_w, p_h, p_h, 0, 0)

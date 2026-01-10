@@ -3,6 +3,7 @@ from __future__ import annotations
 from typing import Dict, Optional
 
 import torch
+from torch import nn
 
 from .base import SIGEModule3d, SIGEModuleWrapper
 from .flow_cache_utils import forward_warp_cache_5d
@@ -16,6 +17,7 @@ class ScatterGather3d(SIGEModule3d):
         gather: Gather3d,
         activation_name: str = "identity",
         activation_first: bool = False,
+        rms_norm: Optional[nn.Module] = None,   # ✅ 新增
     ):
         super().__init__()
         self.gather = SIGEModuleWrapper(gather)
@@ -25,6 +27,11 @@ class ScatterGather3d(SIGEModule3d):
         self.scatter_map: torch.Tensor | None = None
         self.output_res = None
         self.original_outputs = {}
+
+        if rms_norm is not None:
+            self.rms_norm_fn = rms_norm.forward
+        else:
+            self.rms_norm_fn = None
 
     def clear_cache(self):
         self.original_outputs = {}
@@ -79,6 +86,7 @@ class ScatterGather3d(SIGEModule3d):
                 None if shift is None else shift.contiguous(),
                 self.activation_name,
                 self.activation_first,
+                rms_norm_fn=self.rms_norm_fn,   # ✅ 改名，传函数
             )
             if self.sparse_update:
                 updated = scatter3d(

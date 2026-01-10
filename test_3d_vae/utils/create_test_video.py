@@ -86,17 +86,49 @@ def make_step_translation_video(
     #             mask[t, :, W + dx:] = 1  # dx为负时露出右侧
     #     # else: 静止 -> flow=0, mask=0（默认就是0）
 
-    # 保存 mp4
+    # ========= paths =========
     mp4_path = os.path.join(out_dir, out_mp4)
+    frames_dir = os.path.join(out_dir, out_mp4.replace(".mp4", "_frames"))
+    os.makedirs(frames_dir, exist_ok=True)
+
+    # ========= video writer =========
     fourcc = cv2.VideoWriter_fourcc(*"mp4v")
     writer = cv2.VideoWriter(mp4_path, fourcc, fps, (W, H))
     if not writer.isOpened():
         raise RuntimeError(f"Failed to open VideoWriter: {mp4_path}")
-    for t in range(T):
-        writer.write(video[t])
-    writer.release()
 
+    # ========= write =========
+    for t in range(T):
+        frame = video[t]  # (H, W, 3), uint8, BGR
+
+        # 写视频
+        writer.write(frame)
+
+        # 同时保存单帧
+        cv2.imwrite(
+            os.path.join(frames_dir, f"frame_{t:05d}.png"),
+            frame
+        )
+
+    writer.release()
     print(f"[OK] video saved to: {mp4_path}")
+    print(f"[OK] frames saved to: {frames_dir}")
+
+
+
+
+    # avi_path = os.path.join(out_dir, "input.avi")  # 改后缀
+    # fourcc = cv2.VideoWriter_fourcc(*"MJPG")
+    # writer = cv2.VideoWriter(avi_path, fourcc, fps, (W, H))
+    # if not writer.isOpened():
+    #     raise RuntimeError(f"Failed to open VideoWriter: {avi_path}")
+
+    # for t in range(T):
+    #     writer.write(video[t])
+    # writer.release()
+
+    # size = os.path.getsize(avi_path)
+    # print(f"[OK] video saved to: {avi_path}, size={size} bytes")
 
     cap = cv2.VideoCapture(mp4_path)
     ok, frame = cap.read()
@@ -145,7 +177,8 @@ if __name__ == "__main__":
         dx=10,
         dy=0,           # 只向右移动；如果也要向下就改 dy=10
         block_size=4,   # “1,4,4,4...”
-        fill_bgr=(0, 255, 0),
+        first_move_at=5,
+        fill_bgr=(0, 0, 255),
         out_dir="../assets",
         out_mp4="input.mp4",
         fps=10,
