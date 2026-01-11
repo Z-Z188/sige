@@ -9,7 +9,7 @@ def make_step_translation_video(
     dy: int = 0,
     block_size: int = 4,          # “1,4,4,4...”里的 4
     first_move_at: int = 1,       # 0-based：第2帧发生第一次移动 -> t=1
-    fill_bgr=(0, 255, 0),         # 绿色填充（BGR）
+    fill_bgr=(0, 255, 0),         # （BGR）
     out_dir: str = "./out",
     out_mp4: str = "out.mp4",
     fps: int = 10,
@@ -61,30 +61,9 @@ def make_step_translation_video(
         # t=1, 1+block_size, 1+2*block_size, ... 发生移动
         if t >= first_move_at and ((t - first_move_at) % block_size == 0):
             video[t] = do_move_step(video[t - 1])
+            fill_bgr = (255, 0, 0)
         else:
             video[t] = video[t - 1]  # 静止：直接拷贝上一帧
-
-    # # flow/mask：逐对构造（t -> t+1）
-    # flow = np.zeros((T - 1, H, W, 2), dtype=np.float32)
-    # mask = np.zeros((T - 1, H, W), dtype=np.uint8)
-
-    # for t in range(T - 1):
-    #     moved = ((t + 1) >= first_move_at) and (((t + 1) - first_move_at) % block_size == 0)
-    #     if moved:
-    #         flow[t, :, :, 0] = dx
-    #         flow[t, :, :, 1] = dy
-
-    #         # 新露出区域 mask=1
-    #         if dy > 0:
-    #             mask[t, :dy, :] = 1
-    #         elif dy < 0:
-    #             mask[t, H + dy:, :] = 1  # dy为负时露出底部
-
-    #         if dx > 0:
-    #             mask[t, :, :dx] = 1
-    #         elif dx < 0:
-    #             mask[t, :, W + dx:] = 1  # dx为负时露出右侧
-    #     # else: 静止 -> flow=0, mask=0（默认就是0）
 
     # ========= paths =========
     mp4_path = os.path.join(out_dir, out_mp4)
@@ -173,8 +152,8 @@ def make_step_translation_video(
 if __name__ == "__main__":
     video, flow, mask = make_step_translation_video(
         img_path="../assets/input.png",
-        T=13,    
-        dx=10,
+        T=13, 
+        dx=30,
         dy=0,           # 只向右移动；如果也要向下就改 dy=10
         block_size=4,   # “1,4,4,4...”
         first_move_at=5,

@@ -323,7 +323,7 @@ class Encoder3d(nn.Module):
             if i != len(dim_mult) - 1:
                 mode = 'downsample3d' if temperal_downsample[
                     i] else 'downsample2d'
-                downsamples.append(Resample(out_dim, mode=mode))
+                downsamples.append(Resample(out_dim, resample_mode=mode))
                 scale /= 2.0
         self.downsamples = nn.Sequential(*downsamples)
 
@@ -433,7 +433,7 @@ class Decoder3d(nn.Module):
             # upsample block
             if i != len(dim_mult) - 1:
                 mode = 'upsample3d' if temperal_upsample[i] else 'upsample2d'
-                upsamples.append(Resample(out_dim, mode=mode))
+                upsamples.append(Resample(out_dim, resample_mode=mode))
                 scale *= 2.0
         self.upsamples = nn.Sequential(*upsamples)
 

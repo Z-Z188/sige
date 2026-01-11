@@ -28,15 +28,8 @@ from PIL import Image
 
 from torchprofile import profile_macs
 
-# Optional profiling helpers (torch >= 1.8, recommended torch >= 2.0)
-try:
-    from torch.profiler import profile as torch_profile, ProfilerActivity
-except Exception:
-    torch_profile = None
-    ProfilerActivity = None
+from torch.profiler import profile as torch_profile, ProfilerActivity
 
-# TODO: 有2D的gather，scatter需要处理, flow_cache
-# from sige.nn import Gather, Scatter, SIGEConv2d
 from sige3d import SIGECausalConv3d, Gather3d, Scatter3d, \
                    ScatterWithBlockResidual3d, ScatterGather3d, SIGEModel3d, SIGEModule3d, \
                    SIGEConv2d, Gather2d, Scatter2d 
@@ -112,23 +105,10 @@ class RMS_norm(nn.Module):
         self.gamma = nn.Parameter(torch.ones(shape))
         self.bias = nn.Parameter(torch.zeros(shape)) if bias else 0.
 
-    def forward(self, x, return_inv_norm: bool = False):
-            return F.normalize(
+    def forward(self, x):
+        return F.normalize(
                 x, dim=(1 if self.channel_first else
                         -1)) * self.scale * self.gamma + self.bias
-
-        # F.normalize等价的两步写法:
-        # norm = torch.norm(x, p=2, dim=1, keepdim=True)  # 计算L2范数
-        # normalized_x = x / norm
-
-        # dim = 1 if self.channel_first else -1
-        # norm = x.norm(2, dim=dim, keepdim=True) + self.eps
-        # inv_norm = 1.0 / norm
-        # y = x * inv_norm * self.scale * self.gamma + self.bias
-        # if return_inv_norm:
-        #     return y, inv_norm
-        # return y
-
 
 class Upsample(nn.Upsample):
 
@@ -198,7 +178,6 @@ class Resample(SIGEModule3d):
 
             self.downpad = nn.ZeroPad2d((0, 1, 0, 1))
             self.conv = SIGEConv2d(dim, dim, 3, stride=(2, 2))
-            self.conv = nn.Conv2d(dim, dim, 3, stride=(2, 2))
             self.gather2d = Gather2d(self.conv, block_size=block_size)
             self.scatter2d = Scatter2d(self.gather2d)
 
@@ -256,7 +235,6 @@ class Resample(SIGEModule3d):
 
         x = rearrange(x, '(b t) c h w -> b c t h w', t=t)
 
-
         if self.resample_mode == 'downsample3d':
             if feat_cache is not None:
                 idx = feat_idx[0]
@@ -272,10 +250,7 @@ class Resample(SIGEModule3d):
                     feat_idx[0] += 1
         return x
 
-
-
     def sparse_forward(self, x, feat_cache=None, feat_idx=[0]):
-        b, c, t, h, w = x.size()
         if self.resample_mode == 'upsample3d':
             if feat_cache is not None:
                 idx = feat_idx[0]
@@ -304,7 +279,7 @@ class Resample(SIGEModule3d):
                         x = self.time_conv(x, cache)
                     feat_cache[idx] = cache_x
                     feat_idx[0] += 1
-                  
+                 
                     # 把时间维度扩展为2倍, 用通道维翻倍（2C）换来时间维翻倍（2T）
                     N, C2, T, bh, bw = x.shape
                     assert C2 % 2 == 0
@@ -318,17 +293,6 @@ class Resample(SIGEModule3d):
                     x = x.reshape(N, C, T * 2, bh, bw)      # [N, C, 2T, bh, bw]
                     
                     x = self.scatter3d(x)
-            # else:
-            #     x = self.gather3d(x)
-            #     x = self.time_conv(x)
-
-            #     N, C2, T, bh, bw = x.shape
-            #     assert C2 % 2 == 0
-            #     C = C2 // 2
-            #     x = x.view(N, 2, C, T, bh, bw)
-            #     x = x.permute(0, 2, 3, 1, 4, 5)
-            #     x = x.reshape(N, C, T * 2, bh, bw)
-            #     x = self.scatter3d(x)
                     
 
         # 统一做空间 2D resample
@@ -374,11 +338,6 @@ class Resample(SIGEModule3d):
                     feat_cache[idx] = cache_x
                     feat_idx[0] += 1
                     x = self.scatter3d(x)
-            # else:
-            #     x = self.gather3d(x)
-            #     cache = torch.zeros_like(x[:, :, :1])
-            #     x = self.time_conv(torch.cat([cache, x], 2))
-            #     x = self.scatter3d(x)
         return x
     
     def forward(self, x, feat_cache=None, feat_idx=[0], is_first_frame=False):
@@ -404,6 +363,7 @@ class ResidualBlock(SIGEModule3d):
         self.scatter_gather = ScatterGather3d(self.main_gather, activation_name="silu", rms_norm=self.norm2)
         
         if self.in_dim != self.out_dim:
+            # shortcut是1×1×1的卷积，不需要看过去帧，也就不需要类似于WAN的cache_pad
             self.shortcut = SIGECausalConv3d(in_dim, out_dim, kernel_size=1, stride=1, padding=0)
             self.shortcut_gather = Gather3d(self.shortcut, shortcut_block_size)
             self.scatter = ScatterWithBlockResidual3d(self.main_gather, self.shortcut_gather)
@@ -473,17 +433,20 @@ class ResidualBlock(SIGEModule3d):
 
             # 记录 input_res，供后续 set_masks 使用
             x = self.main_gather(x)
-            cache_x = self.scatter_for_time1(x)[:, :, -CACHE_T:, :, :].clone()
+            if feat_cache is not None:
+                cache_x = self.scatter_for_time1(x)[:, :, -CACHE_T:, :, :].clone()
 
-            idx = feat_idx[0]
-            if cache_x.shape[2] < CACHE_T and feat_cache[idx] is not None:
-                cache_x = torch.cat([
-                    feat_cache[idx][:, :, -1, :, :].unsqueeze(2).to(cache_x.device),
-                    cache_x,
-                ], dim=2)
-            x = self.conv1(x, feat_cache[idx])
-            feat_cache[idx] = cache_x
-            feat_idx[0] += 1
+                idx = feat_idx[0]
+                if cache_x.shape[2] < CACHE_T and feat_cache[idx] is not None:
+                    cache_x = torch.cat(
+                        [feat_cache[idx][:, :, -1, :, :].unsqueeze(2).to(cache_x.device), cache_x], dim=2
+                    )
+                x = self.conv1(x, feat_cache[idx])
+                feat_cache[idx] = cache_x
+                feat_idx[0] += 1
+            else:
+                # Non-streaming dense path (e.g., MACs profiling)
+                x = self.conv1(x)
            
 
             # ScatterGather3d 的 baseline 需要是 conv1 的输出（pre-norm2）
@@ -492,17 +455,19 @@ class ResidualBlock(SIGEModule3d):
             x = self.norm2(x)
             x = self.nonlinearity(x)
 
-            cache_x = self.scatter_for_time2(x)[:, :, -CACHE_T:, :, :].clone()
+            if feat_cache is not None:
+                cache_x = self.scatter_for_time2(x)[:, :, -CACHE_T:, :, :].clone()
 
-            idx = feat_idx[0]
-            if cache_x.shape[2] < CACHE_T and feat_cache[idx] is not None:
-                cache_x = torch.cat([
-                    feat_cache[idx][:, :, -1, :, :].unsqueeze(2).to(cache_x.device),
-                    cache_x,
-                ], dim=2)
-            x = self.conv2(x, feat_cache[idx])
-            feat_cache[idx] = cache_x
-            feat_idx[0] += 1
+                idx = feat_idx[0]
+                if cache_x.shape[2] < CACHE_T and feat_cache[idx] is not None:
+                    cache_x = torch.cat(
+                        [feat_cache[idx][:, :, -1, :, :].unsqueeze(2).to(cache_x.device), cache_x], dim=2
+                    )
+                x = self.conv2(x, feat_cache[idx])
+                feat_cache[idx] = cache_x
+                feat_idx[0] += 1
+            else:
+                x = self.conv2(x)
             
             x = self.scatter(x, h)
             
@@ -516,41 +481,46 @@ class ResidualBlock(SIGEModule3d):
         # gather自带rms_norm, 激活函数silu
         x = self.main_gather(x)
 
-        cache_x = self.scatter_for_time1(x)[:, :, -CACHE_T:, :, :].clone()
+        if feat_cache is not None:
+            cache_x = self.scatter_for_time1(x)[:, :, -CACHE_T:, :, :].clone()
 
-        # 对conv特殊处理
-        idx = feat_idx[0]
-        if cache_x.shape[2] < CACHE_T and feat_cache[idx] is not None:
-            # cache last frame of last two chunk
-            cache_x = torch.cat([
-                feat_cache[idx][:, :, -1, :, :].unsqueeze(2).to(cache_x.device),
-                cache_x,
-            ], dim=2)
+            # 对conv特殊处理
+            idx = feat_idx[0]
+            if cache_x.shape[2] < CACHE_T and feat_cache[idx] is not None:
+                # cache last frame of last two chunk
+                cache_x = torch.cat(
+                    [feat_cache[idx][:, :, -1, :, :].unsqueeze(2).to(cache_x.device), cache_x], dim=2
+                )
 
-        cache = self.main_gather(feat_cache[idx], is_cache_gather=True)
-        x = self.conv1(x, cache)
-        feat_cache[idx] = cache_x
-        feat_idx[0] += 1
+            cache = self.main_gather(feat_cache[idx], is_cache_gather=True)
+            x = self.conv1(x, cache)
+            feat_cache[idx] = cache_x
+            feat_idx[0] += 1
+        else:
+            # Non-streaming sparse/profile path (e.g., MACs profiling)
+            x = self.conv1(x)
        
 
         # gather自带激活函数silu
         x = self.scatter_gather(x)
 
-        cache_x = self.scatter_for_time2(x)[:, :, -CACHE_T:, :, :].clone()
+        if feat_cache is not None:
+            cache_x = self.scatter_for_time2(x)[:, :, -CACHE_T:, :, :].clone()
 
-        idx = feat_idx[0]
-        if cache_x.shape[2] < CACHE_T and feat_cache[idx] is not None:
-            # cache last frame of last two chunk
-            cache_x = torch.cat([
-                feat_cache[idx][:, :, -1, :, :].unsqueeze(2).to(cache_x.device),
-                cache_x,
-            ], dim=2)
+            idx = feat_idx[0]
+            if cache_x.shape[2] < CACHE_T and feat_cache[idx] is not None:
+                # cache last frame of last two chunk
+                cache_x = torch.cat(
+                    [feat_cache[idx][:, :, -1, :, :].unsqueeze(2).to(cache_x.device), cache_x], dim=2
+                )
 
-        # 这个gather不需要norm和激活，只是简单的gather即可
-        cache = self.main_gather(feat_cache[idx], is_cache_gather=True)
-        x = self.conv2(x, cache)
-        feat_cache[idx] = cache_x
-        feat_idx[0] += 1
+            # 这个gather不需要norm和激活，只是简单的gather即可
+            cache = self.main_gather(feat_cache[idx], is_cache_gather=True)
+            x = self.conv2(x, cache)
+            feat_cache[idx] = cache_x
+            feat_idx[0] += 1
+        else:
+            x = self.conv2(x)
     
 
         # no sparse: x:[1, 128, 512, 1024], self.scatter = Scatter3d
@@ -830,22 +800,6 @@ def count_conv3d(model):
             count += 1
     return count
 
-def dump_scatter_cache(model, tag=""):
-    total = 0.0
-    print(f"\n==== Scatter original_outputs {tag} ====")
-    for name, m in model.named_modules():
-        if hasattr(m, "original_outputs"):
-            d = getattr(m, "original_outputs", {})
-            mb = 0.0
-            n = 0
-            for v in d.values():
-                if torch.is_tensor(v):
-                    n += 1
-                    mb += v.element_size() * v.nelement() / 1024**2
-            if n > 0:
-                print(f"{name}: entries={n}, {mb:.1f} MB")
-            total += mb
-    print(f"TOTAL Scatter cache: {total:.1f} MB")
 
 class WanVAE_(nn.Module):
 
@@ -876,42 +830,6 @@ class WanVAE_(nn.Module):
                                  attn_scales, self.temperal_upsample, dropout)
         self.first_encode = True
         self.first_decode = True
-
-    def forward(self, x):
-        mu, log_var = self.encode(x)
-        z = self.reparameterize(mu, log_var)
-        x_recon = self.decode(z)
-        return x_recon, mu, log_var
-
-    def encode(self, x, scale):
-        self.clear_cache()
-        # cache
-        t = x.shape[2]
-        iter_ = 1 + (t - 1) // 4
-        # 对encode输入的x，按时间拆分为1、4、4、4....
-        for i in range(iter_):
-            self._enc_conv_idx = [0]
-            if i == 0:
-                out = self.encoder(
-                    x[:, :, :1, :, :],
-                    feat_cache=self._enc_feat_map,
-                    feat_idx=self._enc_conv_idx)
-            else:
-                out_ = self.encoder(
-                    x[:, :, 1 + 4 * (i - 1):1 + 4 * i, :, :],
-                    feat_cache=self._enc_feat_map,
-                    feat_idx=self._enc_conv_idx)
-                out = torch.cat([out, out_], 2)
-
-        mu, log_var = self.conv1(out).chunk(2, dim=1)
-
-        if isinstance(scale[0], torch.Tensor):
-            mu = (mu - scale[0].view(1, self.z_dim, 1, 1, 1)) * scale[1].view(
-                1, self.z_dim, 1, 1, 1)
-        else:
-            mu = (mu - scale[0]) * scale[1]
-        self.clear_cache()
-        return mu
 
     def stream_encode(self, x, scale, mask=None, flow=None):
         # self.clear_cache()
@@ -973,32 +891,6 @@ class WanVAE_(nn.Module):
         # self.clear_cache()
         return mu
 
-    def decode(self, z, scale):
-        self.clear_cache()
-        # z: [b,c,t,h,w]
-        if isinstance(scale[0], torch.Tensor):
-            z = z / scale[1].view(1, self.z_dim, 1, 1, 1) + scale[0].view(
-                1, self.z_dim, 1, 1, 1)
-        else:
-            z = z / scale[1] + scale[0]
-        iter_ = z.shape[2]
-        x = self.conv2(z)
-        for i in range(iter_):
-            self._conv_idx = [0]
-            if i == 0:
-                out = self.decoder(
-                    x[:, :, i:i + 1, :, :],
-                    feat_cache=self._feat_map,
-                    feat_idx=self._conv_idx)
-            else:
-                out_ = self.decoder(
-                    x[:, :, i:i + 1, :, :],
-                    feat_cache=self._feat_map,
-                    feat_idx=self._conv_idx)
-                out = torch.cat([out, out_], 2)
-        self.clear_cache()
-        return out
-
     def stream_decode(self, z, scale, mask=None, flow=None):
         # z: [b,c,t,h,w]
         t = z.shape[2]
@@ -1053,27 +945,6 @@ class WanVAE_(nn.Module):
             out = torch.cat(out, 2)
         # self.clear_cache()
         return out
-
-    def reparameterize(self, mu, log_var):
-        std = torch.exp(0.5 * log_var)
-        eps = torch.randn_like(std)
-        return eps * std + mu
-
-    def sample(self, imgs, deterministic=False):
-        mu, log_var = self.encode(imgs)
-        if deterministic:
-            return mu
-        std = torch.exp(0.5 * log_var.clamp(-30.0, 20.0))
-        return mu + std * torch.randn_like(std)
-
-    def clear_cache(self):
-        self._conv_num = count_conv3d(self.decoder)
-        self._conv_idx = [0]
-        self._feat_map = [None] * self._conv_num
-        # cache encode
-        self._enc_conv_num = count_conv3d(self.encoder)
-        self._enc_conv_idx = [0]
-        self._enc_feat_map = [None] * self._enc_conv_num
 
     def clear_cache_decode(self):
         self._conv_num = count_conv3d(self.decoder)
@@ -1355,13 +1226,13 @@ def _parse_args(argv=None):
     parser.add_argument(
         "-i",
         "--video",
-        default=os.path.join(ASSETS_DIR, "input_red.mp4"),
+        default=os.path.join(ASSETS_DIR, "input.mp4"),
         help="Input video path (mp4).",
     )
     parser.add_argument(
         "-o",
         "--out",
-        default=os.path.join(ASSETS_DIR, "output_red.mp4"),
+        default=os.path.join(ASSETS_DIR, "output.mp4"),
         help="Output video path (mp4).",
     )
     parser.add_argument(
@@ -1372,93 +1243,14 @@ def _parse_args(argv=None):
         metavar=("H", "W"),
         help="Resize input frames to H W before encoding/decoding.",
     )
-    parser.add_argument(
-        "--max-frames",
-        type=int,
-        default=None,
-        help="Optionally truncate to first N frames.",
-    )
-    parser.add_argument(
-        "--profile",
-        action="store_true",
-        help="Use torch.profiler to profile one chunk and print a summary table.",
-    )
-    parser.add_argument(
-        "--profile-chunk",
-        type=int,
-        default=1,
-        help="Which chunk index (0-based) to profile. Use 1+ to hit sparse mode.",
-    )
-    parser.add_argument(
-        "--profile-only",
-        action="store_true",
-        help="Exit after profiling (skip saving output video).",
-    )
-    parser.add_argument(
-        "--profile-row-limit",
-        type=int,
-        default=80,
-        help="Row limit for torch.profiler table output.",
-    )
-    parser.add_argument(
-        "--profile-trace",
-        type=str,
-        default=None,
-        help="Optional path to export Chrome trace json (e.g. trace.json).",
-    )
-    parser.add_argument(
-        "--device",
-        default=None,
-        help='Torch device string, e.g. "cuda:0" or "cpu" (default: auto).',
-    )
     return parser.parse_args(argv)
-
-
-def _print_profiler_focus(prof, *, row_limit: int = 80):
-    events = prof.key_averages()
-
-    has_cuda_events = any(getattr(e, "self_cuda_time_total", 0.0) > 0 for e in events)
-    sort_by = "self_cuda_time_total" if has_cuda_events else "self_cpu_time_total"
-    print(events.table(sort_by=sort_by, row_limit=row_limit))
-
-    def _sum_by_key_substr(substr: str):
-        matched = [e for e in events if substr in e.key]
-        if not matched:
-            return None
-        return {
-            "count": int(sum(getattr(e, "count", 0) for e in matched)),
-            "self_cpu_ms": float(sum(getattr(e, "self_cpu_time_total", 0.0) for e in matched)) / 1000.0,
-            "cpu_ms": float(sum(getattr(e, "cpu_time_total", 0.0) for e in matched)) / 1000.0,
-            "self_cuda_ms": float(sum(getattr(e, "self_cuda_time_total", 0.0) for e in matched)) / 1000.0,
-            "cuda_ms": float(sum(getattr(e, "cuda_time_total", 0.0) for e in matched)) / 1000.0,
-        }
-
-    focus = [
-        "sige3d::forward_warp_cache_5d",
-        "sige3d::forward_warp_cache_5d::grid_sample",
-        "sige3d::gather3d",
-        "sige3d::scatter_gather3d",
-        "aten::grid_sampler_2d",
-    ]
-    print("\n---- Focus (sum by substring) ----")
-    for k in focus:
-        s = _sum_by_key_substr(k)
-        if s is None:
-            print(f"{k}: not found")
-        else:
-            print(
-                f"{k}: count={s['count']} "
-                f"self_cpu={s['self_cpu_ms']:.3f}ms cpu={s['cpu_ms']:.3f}ms "
-                f"self_cuda={s['self_cuda_ms']:.3f}ms cuda={s['cuda_ms']:.3f}ms"
-            )
 
 
 @torch.no_grad()
 def main(argv=None):
     args = _parse_args(argv)
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-    device_str = args.device or ("cuda:0" if torch.cuda.is_available() else "cpu")
-    device = torch.device(device_str)
     dtype = torch.bfloat16
     vae = WanVAEWrapper().to(device=device, dtype=dtype)
 
@@ -1466,7 +1258,7 @@ def main(argv=None):
     out_path = args.out
 
     input_video_original, original_fps = load_mp4_as_tensor(
-        video_path, max_frames=args.max_frames, resize_hw=tuple(args.resize_hw)
+        video_path, resize_hw=tuple(args.resize_hw)
     )
     input_video_original = input_video_original.unsqueeze(0).to(device=device, dtype=dtype)
 
@@ -1489,96 +1281,13 @@ def main(argv=None):
     recon_video_list = []
     # ---- 5,4,4,... 分块 encode ----
     for i, chunk in enumerate(iter_5_4_4_chunks(input_video_original)):
-        do_profile = bool(args.profile and (i == args.profile_chunk))
-        if do_profile:
-            use_cuda = device.type == "cuda"
-            if use_cuda:
-                torch.cuda.synchronize()
-
-            if torch_profile is not None and ProfilerActivity is not None:
-                activities = [ProfilerActivity.CPU]
-                if use_cuda:
-                    activities.append(ProfilerActivity.CUDA)
-
-                with torch_profile(
-                    activities=activities,
-                    record_shapes=True,
-                    profile_memory=True,
-                    with_stack=False,
-                ) as prof:
-                    lat = vae.stream_encode(chunk, mask=masks_enc, flow=flow)   # 逐块喂进去
-                    lat = lat.permute(0, 2, 1, 3, 4)
-                    video = vae.stream_decode_to_pixel(lat, mask=masks_dec, flow=flow)
-                    if hasattr(prof, "step"):
-                        prof.step()
-                    if use_cuda:
-                        torch.cuda.synchronize()
-            else:
-                from torch.autograd.profiler import profile as autograd_profile
-
-                with autograd_profile(
-                    use_cuda=use_cuda,
-                    record_shapes=True,
-                    profile_memory=True,
-                    with_stack=False,
-                ) as prof:
-                    lat = vae.stream_encode(chunk, mask=masks_enc, flow=flow)   # 逐块喂进去
-                    lat = lat.permute(0, 2, 1, 3, 4)
-                    video = vae.stream_decode_to_pixel(lat, mask=masks_dec, flow=flow)
-                    if use_cuda:
-                        torch.cuda.synchronize()
-
-            if args.profile_trace is not None:
-                prof.export_chrome_trace(args.profile_trace)
-                print("exported trace to", args.profile_trace)
-
-            _print_profiler_focus(prof, row_limit=args.profile_row_limit)
-            if args.profile_only:
-                # MACs (similar to `sige/example.py`):
-                # - "full"  : dense inference (no sparsity)
-                # - "profile": symbolic sparse inference (counts only active blocks)
-                enc = vae.model.encoder
-                dec = vae.model.decoder
-
-                with torch.no_grad():
-                    # Encoder MACs
-                    enc.set_mode("full")
-                    full_macs_enc = profile_macs(enc, (chunk,))
-                    enc.set_mode("profile")
-                    enc.set_masks(masks_enc)
-                    sige_macs_enc = profile_macs(enc, (chunk,))
-
-                    # Decoder MACs (profile 1 latent frame, then scale by latent T)
-                    z = lat.permute(0, 2, 1, 3, 4)  # [B, C, T, H, W]
-                    t_lat = int(z.size(2))
-                    z0 = z[:, :, :1, :, :]
-
-                    dec.set_mode("full")
-                    full_macs_dec_frame = profile_macs(dec, (z0,))
-                    dec.set_mode("profile")
-                    dec.set_masks(masks_dec)
-                    sige_macs_dec_frame = profile_macs(dec, (z0,))
-
-                full_macs_total = full_macs_enc + full_macs_dec_frame * max(t_lat, 1)
-                sige_macs_total = sige_macs_enc + sige_macs_dec_frame * max(t_lat, 1)
-
-                print("\n---- MACs ----")
-                print(f"[MACs] Encoder full: {full_macs_enc/1e9:.3f} G, SIGE(profile): {sige_macs_enc/1e9:.3f} G")
-                print(
-                    f"[MACs] Decoder full(per-frame): {full_macs_dec_frame/1e9:.3f} G, "
-                    f"SIGE(profile)(per-frame): {sige_macs_dec_frame/1e9:.3f} G, "
-                    f"T_lat={t_lat}"
-                )
-                print(f"[MACs] Total(full): {full_macs_total/1e9:.3f} G, Total(SIGE): {sige_macs_total/1e9:.3f} G")
-                return
-        else:
-            lat = vae.stream_encode(chunk, mask=masks_enc, flow=flow)   # 逐块喂进去
-            lat = lat.permute(0, 2, 1, 3, 4)
-            video = vae.stream_decode_to_pixel(lat, mask=masks_dec, flow=flow)
+        lat = vae.stream_encode(chunk, mask=masks_enc, flow=flow)   # 逐块喂进去
+        lat = lat.permute(0, 2, 1, 3, 4)
+        video = vae.stream_decode_to_pixel(lat, mask=masks_dec, flow=flow)
 
         recon_video_list.append(video)
         print(f"[Chunk {i}] done!!!")
-        # break     
+        # break
 
 
     video = torch.cat(recon_video_list, dim=1)

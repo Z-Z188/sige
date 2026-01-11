@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import torch
 import torch.nn.functional as F
-from torch.autograd.profiler import record_function
+from torch.profiler import record_function
 
 
 def _as_flow_hw2(flow: torch.Tensor) -> torch.Tensor:

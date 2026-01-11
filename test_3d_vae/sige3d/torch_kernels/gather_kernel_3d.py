@@ -3,7 +3,7 @@ from __future__ import annotations
 import torch
 
 from ..activation import activation
-from torch.autograd.profiler import record_function
+from torch.profiler import record_function
 
 
 def gather3d(

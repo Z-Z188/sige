@@ -63,11 +63,6 @@ class SIGEModule3d(nn.Module):
                 runtime_dict[device] = runtime
             return runtime_dict
 
-        if backend == "auto":
-            torch_kernels = importlib.import_module("sige3d.torch_kernels")
-            torch_runtime = getattr(torch_kernels, function_name, None)
-        else:
-            torch_runtime = None
 
         # "ext" / "cuda" / "native": prefer compiled extension modules (sige.cpu / sige.cuda / sige.mps)
         for device in self.devices:
@@ -127,43 +122,17 @@ class SIGEModel3d(nn.Module):
         for module in self.modules():
             if isinstance(module, SIGEModule3d):
                 module.set_mask(masks, cache, self.timestamp)
-            # if SIGEModule2d is not None and isinstance(module, SIGEModule2d):
-            #     module.set_mask(masks, cache, self.timestamp)
-
+           
     def set_mode(self, mode: str):
         self.mode = mode
         for module in self.modules():
             if isinstance(module, SIGEModule3d):
                 module.set_mode(mode)
-            # if SIGEModule2d is not None and isinstance(module, SIGEModule2d):
-                # module.set_mode(mode)
-    
-
-    def clear_cache(self):
-        for module in self.modules():
-            if isinstance(module, SIGEModule3d):
-                module.clear_cache()
-            # if SIGEModule2d is not None and isinstance(module, SIGEModule2d):
-                # module.clear_cache()
-
-    def clear_stream_cache(self):
-        for module in self.modules():
-            if isinstance(module, SIGEModule3d):
-                module.clear_stream_cache()
-
-    def set_cache_id(self, cache_id: int):
-        for module in self.modules():
-            if isinstance(module, SIGEModule3d):
-                module.set_cache_id(cache_id)
-            # if SIGEModule2d is not None and isinstance(module, SIGEModule2d):
-                # module.set_cache_id(cache_id)
 
     def set_sparse_update(self, sparse_update: bool):
         for module in self.modules():
             if isinstance(module, SIGEModule3d):
                 module.set_sparse_update(sparse_update)
-            # if SIGEModule2d is not None and isinstance(module, SIGEModule2d):
-                # module.set_sparse_update(sparse_update)
 
     def flow_cache(self, flow):
         for module in self.modules():
@@ -189,6 +158,7 @@ class SIGECausalConv3d(nn.Conv3d, SIGEModule3d):
         self.spatial_padding = (int(p_h), int(p_w))
 
         # spatial pad for F.pad order: (Wl, Wr, Hl, Hr, Tl, Tr)
+        # mode = full的时候才需要
         self._spatial_pad = (p_w, p_w, p_h, p_h, 0, 0)
 
         # causal temporal pad: only pad "past" (left) side
