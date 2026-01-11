@@ -34,7 +34,7 @@ class ScatterGather2d(SIGEModule3d):
 
         self.scatter_map = None
         self.output_res = None
-        self.original_outputs = {}
+        self.original_outputs = None
     
     def flow_cache(self, flow):
         """
@@ -44,11 +44,8 @@ class ScatterGather2d(SIGEModule3d):
         - 输出：同形状，output[..., y, x] 从 input[..., y+dy, x+dx] 采样（越界按 0 填充）
         - 对每个时间帧 T 做同样的空间采样（flow 仅依赖 H,W）
         """
-        if flow is None or not self.original_outputs:
-            return
 
-        for cache_id, cached in list(self.original_outputs.items()):
-            self.original_outputs[cache_id] = forward_warp_cache_4d(cached, flow).contiguous()
+        self.original_outputs = forward_warp_cache_4d(self.original_outputs, flow).contiguous()
 
 
 
@@ -62,7 +59,7 @@ class ScatterGather2d(SIGEModule3d):
         block_size = self.gather.module.block_size
         if self.mode == "profile":
             output = torch.full(
-                (self.original_outputs[self.cache_id].size(0) * active_indices.size(0), c, *block_size),
+                (self.original_outputs.size(0) * active_indices.size(0), c, *block_size),
                 fill_value=x[0, 0, 0, 0],
                 dtype=x.dtype,
                 device=x.device,
@@ -75,7 +72,7 @@ class ScatterGather2d(SIGEModule3d):
         elif self.mode == "full":
             output = x
             self.output_res = output.shape[2:]
-            self.original_outputs[self.cache_id] = output.contiguous()
+            self.original_outputs = output.contiguous()
         
         elif self.mode == "sparse":
             device = x.device.type
@@ -92,7 +89,7 @@ class ScatterGather2d(SIGEModule3d):
                     scatter_map = scatter_map.to(device=x.device)
             output = runtime(
                 x.contiguous(),
-                self.original_outputs[self.cache_id].contiguous(),
+                self.original_outputs.contiguous(),
                 block_size[0],
                 block_size[1],
                 active_indices.contiguous(),
@@ -103,10 +100,10 @@ class ScatterGather2d(SIGEModule3d):
                 self.activation_first,
             )
             if self.sparse_update:
-                self.original_outputs[self.cache_id].copy_(
+                self.original_outputs.copy_(
                     self.scatter_runtime[device](
                         x.contiguous(),
-                        self.original_outputs[self.cache_id].contiguous(),
+                        self.original_outputs.contiguous(),
                         self.gather.module.offset[0],
                         self.gather.module.offset[1],
                         self.gather.module.model_stride[0],

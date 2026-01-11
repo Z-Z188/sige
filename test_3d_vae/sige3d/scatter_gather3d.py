@@ -26,21 +26,16 @@ class ScatterGather3d(SIGEModule3d):
 
         self.scatter_map: torch.Tensor | None = None
         self.output_res = None
-        self.original_outputs = {}
+        self.original_outputs = None
 
         if rms_norm is not None:
             self.rms_norm_fn = rms_norm.forward
         else:
             self.rms_norm_fn = None
 
-    def clear_cache(self):
-        self.original_outputs = {}
 
     def flow_cache(self, flow):
-        if flow is None or not self.original_outputs:
-            return
-        for cache_id, cached in list(self.original_outputs.items()):
-            self.original_outputs[cache_id] = forward_warp_cache_5d(cached, flow).contiguous()
+        self.original_outputs = forward_warp_cache_5d(self.original_outputs, flow).contiguous()
 
     def forward(
         self, x: torch.Tensor, scale: Optional[torch.Tensor] = None, shift: Optional[torch.Tensor] = None
@@ -52,10 +47,8 @@ class ScatterGather3d(SIGEModule3d):
         block_size = self.gather.module.block_size
 
         if self.mode == "profile":
-            if self.cache_id not in self.original_outputs:
-                raise RuntimeError("ScatterGather3d requires a full forward baseline before profile mode.")
-            b = int(self.original_outputs[self.cache_id].size(0))
-            t = int(self.original_outputs[self.cache_id].size(2))
+            b = int(self.original_outputs.size(0))
+            t = int(self.original_outputs.size(2))
             _, c, _, _, _ = x.shape
             return torch.full(
                 (b * active_indices.size(0), c, t, *block_size),
@@ -67,17 +60,15 @@ class ScatterGather3d(SIGEModule3d):
         if self.mode == "full":
             output = x
             self.output_res = output.shape[2:]  # (T,H,W)
-            self.original_outputs[self.cache_id] = output.contiguous()
+            self.original_outputs = output.contiguous()
             return output
 
         if self.mode == "sparse":
-            if self.cache_id not in self.original_outputs:
-                raise RuntimeError("ScatterGather3d requires a full forward baseline before sparse mode.")
             if self.scatter_map is None:
                 raise RuntimeError("scatter_map is not set. Call set_masks() first.")
             output = scatter_gather3d(
                 x.contiguous(),
-                self.original_outputs[self.cache_id].contiguous(),
+                self.original_outputs.contiguous(),
                 block_size[0],
                 block_size[1],
                 active_indices.contiguous(),
@@ -91,7 +82,7 @@ class ScatterGather3d(SIGEModule3d):
             if self.sparse_update:
                 updated = scatter3d(
                     x.contiguous(),
-                    self.original_outputs[self.cache_id].contiguous(),
+                    self.original_outputs.contiguous(),
                     self.gather.module.offset[0],
                     self.gather.module.offset[1],
                     self.gather.module.model_stride[0],
@@ -99,7 +90,7 @@ class ScatterGather3d(SIGEModule3d):
                     active_indices.contiguous(),
                     None,
                 )
-                self.original_outputs[self.cache_id].copy_(updated)
+                self.original_outputs.copy_(updated)
             return output
 
         raise NotImplementedError(f"Unknown mode: {self.mode}")

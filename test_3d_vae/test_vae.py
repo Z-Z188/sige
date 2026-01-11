@@ -28,8 +28,6 @@ from PIL import Image
 
 from torchprofile import profile_macs
 
-from torch.profiler import profile as torch_profile, ProfilerActivity
-
 from sige3d import SIGECausalConv3d, Gather3d, Scatter3d, \
                    ScatterWithBlockResidual3d, ScatterGather3d, SIGEModel3d, SIGEModule3d, \
                    SIGEConv2d, Gather2d, Scatter2d 
@@ -1277,17 +1275,16 @@ def main(argv=None):
     mask_dec = dilate_mask(mask, 40)
     masks_dec = downsample_mask(mask_dec, min_res=(4, 4), dilation=0)
 
-
     recon_video_list = []
-    # ---- 5,4,4,... 分块 encode ----
+
     for i, chunk in enumerate(iter_5_4_4_chunks(input_video_original)):
-        lat = vae.stream_encode(chunk, mask=masks_enc, flow=flow)   # 逐块喂进去
+        lat = vae.stream_encode(chunk, mask=masks_enc, flow=flow)
         lat = lat.permute(0, 2, 1, 3, 4)
+
         video = vae.stream_decode_to_pixel(lat, mask=masks_dec, flow=flow)
 
         recon_video_list.append(video)
         print(f"[Chunk {i}] done!!!")
-        # break
 
 
     video = torch.cat(recon_video_list, dim=1)
