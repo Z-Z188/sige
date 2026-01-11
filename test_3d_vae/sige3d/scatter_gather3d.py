@@ -6,8 +6,8 @@ import torch
 from torch import nn
 
 from .base import SIGEModule3d, SIGEModuleWrapper
-from .flow_cache_utils import forward_warp_cache_5d
-from .gather import Gather3d
+from utils.flow_cache_utils import forward_warp_cache_5d
+from .gather3d import Gather3d
 from .torch_kernels import get_scatter_map, scatter3d, scatter_gather3d
 
 

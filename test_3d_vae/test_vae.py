@@ -36,9 +36,12 @@ except Exception:
     ProfilerActivity = None
 
 # TODO: 有2D的gather，scatter需要处理, flow_cache
-from sige.nn import Gather, Scatter, SIGEConv2d
-from sige3d import SIGECausalConv3d, Gather3d, Scatter3d, ScatterWithBlockResidual3d, ScatterGather3d, SIGEModel3d, SIGEModule3d
-from sige.utils import dilate_mask, downsample_mask
+# from sige.nn import Gather, Scatter, SIGEConv2d
+from sige3d import SIGECausalConv3d, Gather3d, Scatter3d, \
+                   ScatterWithBlockResidual3d, ScatterGather3d, SIGEModel3d, SIGEModule3d, \
+                   SIGEConv2d, Gather2d, Scatter2d 
+
+from utils.mask_utils import dilate_mask, downsample_mask
 
 
 from debugUtil import enable_custom_repr
@@ -154,8 +157,8 @@ class Resample(SIGEModule3d):
             self.conv = SIGEConv2d(dim, dim // 2, 3, padding=1)
             # self.conv = nn.Conv2d(dim, dim // 2, 3, padding=1)
 
-            self.gather2d = Gather(self.conv, block_size=block_size)
-            self.scatter2d = Scatter(self.gather2d)
+            self.gather2d = Gather2d(self.conv, block_size=block_size)
+            self.scatter2d = Scatter2d(self.gather2d)
 
         elif resample_mode == 'upsample3d':
             # self.resample = nn.Sequential(
@@ -166,8 +169,8 @@ class Resample(SIGEModule3d):
             self.conv = SIGEConv2d(dim, dim // 2, 3, padding=1)
             # self.conv = nn.Conv2d(dim, dim // 2, 3, padding=1)
 
-            self.gather2d = Gather(self.conv, block_size=block_size)
-            self.scatter2d = Scatter(self.gather2d)
+            self.gather2d = Gather2d(self.conv, block_size=block_size)
+            self.scatter2d = Scatter2d(self.gather2d)
 
             # TODO: 和ResnetBlck一样，也是两次卷积操作，看看能不能用scatter_gather来合并中间的一次scatter和gather
             # 先用普通的两次代替
@@ -185,8 +188,8 @@ class Resample(SIGEModule3d):
             self.downpad = nn.ZeroPad2d((0, 1, 0, 1))
             self.conv = SIGEConv2d(dim, dim, 3, stride=(2, 2))
             # self.conv = nn.Conv2d(dim, dim, 3, stride=(2, 2))
-            self.gather2d = Gather(self.conv, block_size=block_size)
-            self.scatter2d = Scatter(self.gather2d)
+            self.gather2d = Gather2d(self.conv, block_size=block_size)
+            self.scatter2d = Scatter2d(self.gather2d)
             
         elif resample_mode == 'downsample3d':
             # self.resample = nn.Sequential(
@@ -196,8 +199,8 @@ class Resample(SIGEModule3d):
             self.downpad = nn.ZeroPad2d((0, 1, 0, 1))
             self.conv = SIGEConv2d(dim, dim, 3, stride=(2, 2))
             self.conv = nn.Conv2d(dim, dim, 3, stride=(2, 2))
-            self.gather2d = Gather(self.conv, block_size=block_size)
-            self.scatter2d = Scatter(self.gather2d)
+            self.gather2d = Gather2d(self.conv, block_size=block_size)
+            self.scatter2d = Scatter2d(self.gather2d)
 
             self.time_conv = SIGECausalConv3d(
                 dim, dim, (3, 1, 1), stride=(2, 1, 1), padding=(0, 0, 0))

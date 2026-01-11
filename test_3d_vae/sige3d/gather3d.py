@@ -6,7 +6,7 @@ from typing import Dict, Optional, Tuple, Union
 import torch
 from torch import nn
 
-from sige.utils import reduce_mask
+from utils.mask_utils import reduce_mask
 from .base import SIGEModule3d
 from .torch_kernels import gather3d
 

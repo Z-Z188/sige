@@ -1,0 +1,132 @@
+import warnings
+from typing import Dict, Optional, Tuple, Union
+
+import torch
+from torch import nn
+
+from utils.mask_utils import reduce_mask
+from .base import SIGEModule3d
+from .activation import activation
+
+
+class Gather2d(SIGEModule3d):
+    """
+    backend:
+      - "torch": use PyTorch reference kernels in `sige/cuda/*_kernel.py` via `sige.nn.torch_kernels`
+      - "ext"/"cuda": use compiled extension (`sige.cpu` / `sige.cuda` / `sige.mps`)
+    """
+
+    def __init__(
+        self,
+        conv: nn.Conv2d,
+        block_size: Union[int, Tuple[int, int]],
+        offset: Optional[Union[int, Tuple[int, int]]] = None,
+        activation_name: str = "identity",
+        activation_first: bool = False,
+        verbose: bool = False,
+        backend: str = "torch",
+    ):
+        super(Gather2d, self).__init__()
+        if isinstance(block_size, int):
+            block_size = (block_size, block_size)
+
+        # 下取整
+        n0 = max(block_size[0] - conv.kernel_size[0], 0) // conv.stride[0]
+        n1 = max(block_size[1] - conv.kernel_size[1], 0) // conv.stride[1]
+        b0 = n0 * conv.stride[0] + conv.kernel_size[0]
+        b1 = n1 * conv.stride[1] + conv.kernel_size[1]
+        if (b0, b1) != block_size:
+            warnings.warn("Change the block size from (%d, %d) to (%d, %d)" % (*block_size, b0, b1))
+
+        self.model_stride = conv.stride
+        self.kernel_size = conv.kernel_size
+
+        self.block_size = (b0, b1)
+
+        # block_stride的含义
+        # 当你在输入上移动一个 block，到下一个 block 的起始位置时，
+        # 在原始特征图上，要跨过多少像素，才能刚好对应“下一个输出位置块”
+        self.block_stride = ((n0 + 1) * conv.stride[0], (n1 + 1) * conv.stride[1])
+
+
+        if offset is None:
+            self.offset = conv.padding
+        else:
+            if isinstance(offset, int):
+                offset = (offset, offset)
+            self.offset = offset
+        self.activation_name = activation_name
+        self.activation_first = activation_first
+        self.verbose = verbose
+
+        self.backend = backend
+        self.load_runtime_with_backend("gather2d", backend=self.backend)
+
+        self.input_res: Optional[Tuple[int, int]] = None
+        self.active_indices: Optional[torch.Tensor] = None
+
+    def forward(
+        self, x: torch.Tensor, scale: Optional[torch.Tensor] = None, shift: Optional[torch.Tensor] = None
+    ) -> torch.Tensor:
+        self.check_dtype(x, scale, shift)
+        self.check_dim(x, scale, shift)
+        b, c, h, w = x.shape
+
+        if self.mode == "profile":
+            output = torch.full(
+                (b * self.active_indices.size(0), c, *self.block_size),
+                fill_value=x[0, 0, 0, 0],
+                dtype=x.dtype,
+                device=x.device,
+            )  # create a dummy gather output depending on the input for profiling
+            if scale is not None:
+                output = output * scale[0, 0, 0, 0]
+            if shift is not None:
+                output = output + shift[0, 0, 0, 0]
+            output = activation(output, self.activation_name)
+
+        elif self.mode == "full":
+            self.input_res = x.shape[2:]
+            assert scale is None
+            assert shift is None
+            output = x
+            
+        elif self.mode == "sparse":
+            device = x.device.type
+            runtime = self.runtime[device]
+            assert runtime is not None
+            active_indices = self.active_indices
+            assert active_indices is not None
+            if self.backend.lower() not in {"torch", "pytorch"} and active_indices.device != x.device:
+                active_indices = active_indices.to(device=x.device)
+            output = runtime(
+                x.contiguous(),
+                self.block_size[0],
+                self.block_size[1],
+                active_indices.contiguous(),
+                None if scale is None else scale.contiguous(),
+                None if shift is None else shift.contiguous(),
+                self.activation_name,
+                self.activation_first,
+            )
+        else:
+            raise NotImplementedError("Unknown mode: [%s]!!!" % self.mode)
+        return output
+
+    def set_mask(self, masks: Dict, cache: Dict, timestamp: int):
+        if self.timestamp != timestamp:
+            super(Gather2d, self).set_mask(masks, cache, timestamp)
+            assert self.input_res is not None
+            res = tuple(self.input_res)
+            mask = masks[res]
+            self.mask = mask
+            key = ("active_indices", *res, *self.block_size, *self.block_stride, *self.offset)
+            active_indices = cache.get(key, None)
+            if active_indices is None:
+                active_indices = reduce_mask(
+                    mask, self.block_size, self.block_stride, self.offset, verbose=self.verbose
+                )
+                if self.backend.lower() in {"torch", "pytorch"} and active_indices is not None:
+                    active_indices = active_indices.detach().cpu()
+                cache[key] = active_indices
+            self.active_indices = active_indices

@@ -1,4 +1,6 @@
 from __future__ import annotations
+import importlib
+import os
 
 import inspect
 from typing import Dict, List, Optional
@@ -10,18 +12,16 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-try:
-    from sige.nn import SIGEModule as SIGEModule2d
-except Exception:
-    SIGEModule2d = None
-
 
 class SIGEModule3d(nn.Module):
     def __init__(self, call_super: bool = True):
         if call_super:
             super().__init__()
+        # self.devices: List[str] = ["cpu", "cuda", "mps"]
+        self.devices: List[str] = ["cuda"]
         self.supported_dtypes = [torch.float32, torch.float16, torch.bfloat16]
         self.mode: str = "full"
+        self.runtime: Dict = {}
         self.mask: Optional[torch.Tensor] = None
         self.timestamp: Optional[int] = None
         self.cache_id: int = 0
@@ -42,6 +42,49 @@ class SIGEModule3d(nn.Module):
     def clear_stream_cache(self):
         pass
 
+    def load_runtime_with_backend(self, function_name: str, runtime_dict: Dict = None, backend: str = "ext"):
+        """
+        backend:
+          - "torch": use pure PyTorch reference kernels from `sige.nn.torch_kernels`
+          - "ext"/"cuda": use compiled extension modules (`sige.cpu` / `sige.cuda` / `sige.mps`)
+          - "auto": prefer extensions, fall back to torch when missing
+        """
+        if runtime_dict is None:
+            runtime_dict = self.runtime
+        backend = (backend or "ext").lower()
+
+        if backend in {"torch", "pytorch"}:
+            torch_kernels = importlib.import_module("sige3d.torch_kernels")
+            try:
+                runtime = getattr(torch_kernels, function_name)
+            except AttributeError as e:
+                raise AttributeError(f"torch_kernels has no function [{function_name}]") from e
+            for device in self.devices:
+                runtime_dict[device] = runtime
+            return runtime_dict
+
+        if backend == "auto":
+            torch_kernels = importlib.import_module("sige3d.torch_kernels")
+            torch_runtime = getattr(torch_kernels, function_name, None)
+        else:
+            torch_runtime = None
+
+        # "ext" / "cuda" / "native": prefer compiled extension modules (sige.cpu / sige.cuda / sige.mps)
+        for device in self.devices:
+            name = "sige.%s" % device
+            try:
+                module = importlib.import_module(name)
+                runtime = getattr(module, function_name)
+                runtime_dict[device] = runtime
+                if device == "mps":
+                    os.environ["SIGE_METAL_LIB_PATH"] = os.path.abspath(
+                        os.path.join(os.path.dirname(module.__file__), "..", "sige.metallib")
+                    )
+            except (ModuleNotFoundError, AttributeError):
+                runtime_dict[device] = torch_runtime if torch_runtime is not None else None
+        return runtime_dict
+
+
     def set_sparse_update(self, sparse_update: bool):
         self.sparse_update = sparse_update
             
@@ -60,7 +103,7 @@ class SIGEModule3d(nn.Module):
         for x in args:
             if x is None:
                 continue
-            if x.dim() != 5:
+            if x.dim() != 5 and x.dim() != 4:
                 raise NotImplementedError(
                     f"[{self.__class__.__name__}] does not support input with dim [{x.dim()}]."
                 )
@@ -84,24 +127,24 @@ class SIGEModel3d(nn.Module):
         for module in self.modules():
             if isinstance(module, SIGEModule3d):
                 module.set_mask(masks, cache, self.timestamp)
-            if SIGEModule2d is not None and isinstance(module, SIGEModule2d):
-                module.set_mask(masks, cache, self.timestamp)
+            # if SIGEModule2d is not None and isinstance(module, SIGEModule2d):
+            #     module.set_mask(masks, cache, self.timestamp)
 
     def set_mode(self, mode: str):
         self.mode = mode
         for module in self.modules():
             if isinstance(module, SIGEModule3d):
                 module.set_mode(mode)
-            if SIGEModule2d is not None and isinstance(module, SIGEModule2d):
-                module.set_mode(mode)
+            # if SIGEModule2d is not None and isinstance(module, SIGEModule2d):
+                # module.set_mode(mode)
     
 
     def clear_cache(self):
         for module in self.modules():
             if isinstance(module, SIGEModule3d):
                 module.clear_cache()
-            if SIGEModule2d is not None and isinstance(module, SIGEModule2d):
-                module.clear_cache()
+            # if SIGEModule2d is not None and isinstance(module, SIGEModule2d):
+                # module.clear_cache()
 
     def clear_stream_cache(self):
         for module in self.modules():
@@ -112,15 +155,15 @@ class SIGEModel3d(nn.Module):
         for module in self.modules():
             if isinstance(module, SIGEModule3d):
                 module.set_cache_id(cache_id)
-            if SIGEModule2d is not None and isinstance(module, SIGEModule2d):
-                module.set_cache_id(cache_id)
+            # if SIGEModule2d is not None and isinstance(module, SIGEModule2d):
+                # module.set_cache_id(cache_id)
 
     def set_sparse_update(self, sparse_update: bool):
         for module in self.modules():
             if isinstance(module, SIGEModule3d):
                 module.set_sparse_update(sparse_update)
-            if SIGEModule2d is not None and isinstance(module, SIGEModule2d):
-                module.set_sparse_update(sparse_update)
+            # if SIGEModule2d is not None and isinstance(module, SIGEModule2d):
+                # module.set_sparse_update(sparse_update)
 
     def flow_cache(self, flow):
         for module in self.modules():
@@ -178,7 +221,7 @@ class SIGECausalConv3d(nn.Conv3d, SIGEModule3d):
             # sparse：假设 gather 已经提供了 HW halo，所以只做 T 因果 padding
             x = self._apply_temporal_pad(x, cache_x)
 
-            return F.conv3d(
+            return F.conv3d(    # pylint: disable=not-callable
                 x, self.weight, self.bias,
                 self.stride, (0, 0, 0),
                 self.dilation, self.groups
@@ -186,3 +229,18 @@ class SIGECausalConv3d(nn.Conv3d, SIGEModule3d):
 
         else:
             raise NotImplementedError(f"Unknown mode: {self.mode}")
+
+
+class SIGEConv2d(nn.Conv2d, SIGEModule3d):
+    def __init__(self, *args, **kwargs):
+        nn.Conv2d.__init__(self, *args, **kwargs)
+        SIGEModule3d.__init__(self, call_super=False)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        if self.mode == "full":
+            output = super(SIGEConv2d, self).forward(x)
+        elif self.mode in ["sparse", "profile"]:
+            output = F.conv2d(x, self.weight, self.bias, self.stride, (0, 0), self.dilation, self.groups) # pylint: disable=not-callable
+        else:
+            raise NotImplementedError("Unknown mode: %s" % self.mode)
+        return output

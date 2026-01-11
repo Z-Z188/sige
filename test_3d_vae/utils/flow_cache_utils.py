@@ -94,3 +94,48 @@ def forward_warp_cache_5d(cache: torch.Tensor, flow: torch.Tensor) -> torch.Tens
                 align_corners=True,
             )
         return warped.view(b, t, c, h, w).permute(0, 2, 1, 3, 4).contiguous()
+
+
+def forward_warp_cache_4d(cache: torch.Tensor, flow: torch.Tensor) -> torch.Tensor:
+    """
+    Backward-warp cached features by bilinear sampling (grid_sample).
+
+    - cache: (B, C, H, W)
+    - flow:  (H, W, 2) / (2, H, W) / (1, 2, H, W), (dx, dy) in pixel units
+    - output: same shape, output[..., y, x] samples input at (x+dx, y+dy)
+    """
+    with record_function("sige3d::forward_warp_cache_4d"):
+        if cache.dim() != 4:
+            raise ValueError(f"cache must be 4D (B,C,H,W); got {tuple(cache.shape)}")
+        b, c, h, w = cache.shape
+
+        flow = normalize_flow(flow, int(h), int(w), device=cache.device)
+
+        # Base grid in pixel coords: (x,y) with x in [0,w-1], y in [0,h-1].
+        y = torch.arange(h, device=cache.device, dtype=torch.float32).view(h, 1)
+        x = torch.arange(w, device=cache.device, dtype=torch.float32).view(1, w)
+        base_x = x.expand(h, w)
+        base_y = y.expand(h, w)
+
+        sample_x = base_x + flow[..., 0]
+        sample_y = base_y + flow[..., 1]
+
+        # Normalize to [-1, 1] for grid_sample (align_corners=True).
+        w_denom = float(max(w - 1, 1))
+        h_denom = float(max(h - 1, 1))
+        x_grid = 2.0 * sample_x / w_denom - 1.0
+        y_grid = 2.0 * sample_y / h_denom - 1.0
+        grid = torch.stack([x_grid, y_grid], dim=-1)  # (H,W,2)
+
+        # Expand to batch.
+        grid_b = grid.unsqueeze(0).expand(b, h, w, 2).to(dtype=cache.dtype)
+
+        with record_function("sige3d::forward_warp_cache_4d::grid_sample"):
+            warped = F.grid_sample(
+                cache,
+                grid_b,
+                mode="bilinear",
+                padding_mode="zeros",
+                align_corners=True,
+            )
+        return warped

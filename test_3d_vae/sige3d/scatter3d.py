@@ -3,10 +3,10 @@ from __future__ import annotations
 from typing import Optional
 
 import torch
+from utils.flow_cache_utils import forward_warp_cache_5d
 
 from .base import SIGEModule3d, SIGEModuleWrapper
-from .flow_cache_utils import forward_warp_cache_5d
-from .gather import Gather3d
+from .gather3d import Gather3d
 from .torch_kernels import scatter3d, scatter_with_block_residual3d
 
 
