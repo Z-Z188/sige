@@ -37,7 +37,6 @@ class Scatter3d(SIGEModule3d):
         self.check_dim(x, residual)
 
         if self.mode == "profile":
-            raise RuntimeError("Scatter3d requires a full forward baseline before profile mode.")
             _, c, t, _, _ = x.shape
             b = int(self.original_outputs.size(0))
             output = torch.full(
