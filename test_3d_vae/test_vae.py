@@ -25,7 +25,7 @@ from abc import abstractmethod, ABC
 import re
 from collections import OrderedDict
 from PIL import Image
-
+import time
 from torchprofile import profile_macs
 
 from sige3d import SIGECausalConv3d, Gather3d, Scatter3d, \
@@ -133,9 +133,31 @@ class RMS_norm(nn.Module):
         self.bias = nn.Parameter(torch.zeros(shape)) if bias else 0.
 
     def forward(self, x):
-        return F.normalize(
-                x, dim=(1 if self.channel_first else
-                        -1)) * self.scale * self.gamma + self.bias
+        # NOTE: Use the same kernel backend switch as SIGE gather/scatter ops.
+        if x.is_cuda:
+            try:
+                from sige3d.torch_kernels import get_kernel_backend
+
+                use_cuda = get_kernel_backend() == "cuda"
+            except Exception:
+                use_cuda = False
+
+            if use_cuda:
+                try:
+                    from sige3d.cuda_kernels import get_extension
+
+                    ext = get_extension()
+                    gamma = self.gamma.to(device=x.device, dtype=x.dtype).reshape(-1).contiguous()
+                    bias = None
+                    if torch.is_tensor(self.bias):
+                        bias = self.bias.to(device=x.device, dtype=x.dtype).reshape(-1).contiguous()
+                    return ext.rms_norm(x.contiguous(), gamma, bias, float(self.eps), bool(self.channel_first))
+                except Exception:
+                    pass
+
+        gamma = self.gamma.to(device=x.device, dtype=x.dtype)
+        bias = self.bias if not torch.is_tensor(self.bias) else self.bias.to(device=x.device, dtype=x.dtype)
+        return F.normalize(x, dim=(1 if self.channel_first else -1), eps=self.eps) * self.scale * gamma + bias
 
 class Upsample(nn.Upsample):
 
@@ -811,7 +833,6 @@ def count_conv3d(model):
             count += 1
     return count
 
-
 class WanVAE_(nn.Module):
 
     def __init__(self,
@@ -1261,12 +1282,30 @@ def _parse_args(argv=None):
         metavar=("H", "W"),
         help="Resize input frames to H W before encoding/decoding.",
     )
+    def _kernel_backend(v: str) -> str:
+        v = (v or "").strip().lower()
+        if v in {"pytorch", "torch"}:
+            return "pytorch"
+        if v in {"cuda", "ext"}:
+            return "cuda"
+        raise argparse.ArgumentTypeError("Expected 'PyTorch' or 'CUDA'.")
+
+    parser.add_argument(
+        "--sige-kernels",
+        type=_kernel_backend,
+        default="pytorch",
+        help="SIGE gather/scatter kernel backend: PyTorch (default) or CUDA.",
+    )
     return parser.parse_args(argv)
 
 
 @torch.no_grad()
 def main(argv=None):
     args = _parse_args(argv)
+
+    from sige3d.torch_kernels import set_kernel_backend
+
+    set_kernel_backend(args.sige_kernels)
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
     dtype = torch.bfloat16
@@ -1316,9 +1355,20 @@ def main(argv=None):
     # enc_wrap = EncWrap(vae, masks_enc, flow).to(device).eval()
     # dec_wrap = DecWrap(vae, masks_dec, flow).to(device).eval()
 
-   
 
     recon_video_list = []
+    enc_times = []
+    dec_times = []
+    tot_times = []
+
+    # CUDA events（复用，避免每次创建开销）
+    enc_s = torch.cuda.Event(enable_timing=True)
+    enc_e = torch.cuda.Event(enable_timing=True)
+    dec_s = torch.cuda.Event(enable_timing=True)
+    dec_e = torch.cuda.Event(enable_timing=True)
+    tot_s = torch.cuda.Event(enable_timing=True)
+    tot_e = torch.cuda.Event(enable_timing=True)
+
 
     for i, chunk in enumerate(iter_5_4_4_chunks(input_video_original)):
         # if i != 0:
@@ -1336,20 +1386,77 @@ def main(argv=None):
    
         #     print("SIGE MACs: %.2fG" % (m_enc / 1e9))
         #     exit(0)
+        if i > 0:
+            torch.cuda.synchronize()
+            tot_s.record()
 
+            # -------- Encoder timing --------
+            enc_s.record()
+            lat = vae.stream_encode(chunk, mask=masks_enc, flow=flow)
+            enc_e.record()
 
-        lat = vae.stream_encode(chunk, mask=masks_enc, flow=flow)
-        lat = lat.permute(0, 2, 1, 3, 4)
+            # 如果你想“encoder时间里包含 permute”，就把 permute 放在 enc_e 前面
+            lat = lat.permute(0, 2, 1, 3, 4)
 
-        video = vae.stream_decode_to_pixel(lat, mask=masks_dec, flow=flow)
-        print(
-            f"[Chunk {i}] cache: "
-            f"feat_map={format_bytes(feat_map_nbytes(vae.model))} "
-            f"scatter_total={format_bytes(scatter_cache_nbytes(scatter_cache_modules))}"
-        )
+            # -------- Decoder timing --------
+            dec_s.record()
+            video = vae.stream_decode_to_pixel(lat, mask=masks_dec, flow=flow)
+            dec_e.record()
+
+            tot_e.record()
+            torch.cuda.synchronize()
+
+            enc_ms = enc_s.elapsed_time(enc_e)
+            dec_ms = dec_s.elapsed_time(dec_e)
+            tot_ms = tot_s.elapsed_time(tot_e)
+
+            enc_times.append(enc_ms)
+            dec_times.append(dec_ms)
+            tot_times.append(tot_ms)
+
+            print(f"[Chunk {i}] enc={enc_ms:.2f} ms | dec={dec_ms:.2f} ms | total={tot_ms:.2f} ms")
+        else:
+            # chunk0 warmup（不计时）
+            lat = vae.stream_encode(chunk, mask=masks_enc, flow=flow)
+            lat = lat.permute(0, 2, 1, 3, 4)
+            video = vae.stream_decode_to_pixel(lat, mask=masks_dec, flow=flow)
 
         recon_video_list.append(video)
         print(f"[Chunk {i}] done!!!")
+
+
+        # if i > 0:
+        #     torch.cuda.synchronize()
+        #     t0 = time.time()
+
+        # lat = vae.stream_encode(chunk, mask=masks_enc, flow=flow)
+        # lat = lat.permute(0, 2, 1, 3, 4)
+
+        # video = vae.stream_decode_to_pixel(lat, mask=masks_dec, flow=flow)
+
+        # if i > 0:                      # 跳过第 0 个 chunk
+        #     torch.cuda.synchronize()
+        #     dt = (time.time() - t0) * 1000  # ms
+        #     chunk_times.append(dt)
+        #     print(f"[Chunk {i}] time = {dt:.2f} ms")
+
+        # # print(
+        # #     f"[Chunk {i}] cache: "
+        # #     f"feat_map={format_bytes(feat_map_nbytes(vae.model))} "
+        # #     f"scatter_total={format_bytes(scatter_cache_nbytes(scatter_cache_modules))}"
+        # # )
+
+        # recon_video_list.append(video)
+        # print(f"[Chunk {i}] done!!!")
+
+    enc_avg = float(np.mean(enc_times)) if enc_times else 0.0
+    dec_avg = float(np.mean(dec_times)) if dec_times else 0.0
+    tot_avg = float(np.mean(tot_times)) if tot_times else 0.0
+
+    print("==== Encoder/Decoder Timing (except chunk 0) ====")
+    print(f"enc avg  = {enc_avg:.2f} ms")
+    print(f"dec avg  = {dec_avg:.2f} ms")
+    print(f"total avg= {tot_avg:.2f} ms")
 
 
     video = torch.cat(recon_video_list, dim=1)
@@ -1384,16 +1491,16 @@ def main(argv=None):
 
 if __name__ == "__main__":
     torch.cuda.reset_peak_memory_stats()
-    torch.cuda.synchronize()                # ① 确保起点干净
-    start = torch.cuda.Event(True)
-    end   = torch.cuda.Event(True)
-    start.record()                          # ② 开始计时
+    # torch.cuda.synchronize()                # ① 确保起点干净
+    # start = torch.cuda.Event(True)
+    # end   = torch.cuda.Event(True)
+    # start.record()                          # ② 开始计时
 
     main()
 
-    end.record()                            # ③ 结束计时
-    torch.cuda.synchronize()                # ④ 等 GPU 跑完
+    # end.record()                            # ③ 结束计时
+    # torch.cuda.synchronize()                # ④ 等 GPU 跑完
 
     print_sige_op_time_stats()
     print(f"Peak GPU memory: {torch.cuda.max_memory_allocated() / 1024**3:.3f} GB")
-    print(f"Total GPU time: {start.elapsed_time(end)/1000:.3f} s")
+    # print(f"Total GPU time: {start.elapsed_time(end)/1000:.3f} s")

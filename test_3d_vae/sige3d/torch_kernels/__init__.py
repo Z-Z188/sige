@@ -6,6 +6,8 @@ from .gather_kernel_2d import gather2d
 from .scatter_kernel_2d import scatter2d, scatter_with_block_residual2d
 from .scatter_gather_kernel_2d import get_scatter_map2d, scatter_gather2d
 
+from .backend import get_kernel_backend, set_kernel_backend
+
 __all__ = [
     "gather3d",
     "scatter3d",
@@ -17,5 +19,7 @@ __all__ = [
     "scatter2d",
     "scatter_with_block_residual2d",
     "get_scatter_map2d",
-    "scatter_gather2d"
+    "scatter_gather2d",
+    "get_kernel_backend",
+    "set_kernel_backend",
 ]

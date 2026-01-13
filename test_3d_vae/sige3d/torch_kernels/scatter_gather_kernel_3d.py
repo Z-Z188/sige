@@ -3,6 +3,7 @@ from __future__ import annotations
 import torch
 
 from ..activation import activation
+from .backend import use_cuda_kernels
 
 # slow
 # def get_scatter_map(
@@ -59,6 +60,27 @@ def get_scatter_map(
 
     if active_indices.numel() == 0:
         return scatter_map
+
+    if active_indices.is_cuda and use_cuda_kernels():
+        try:
+            from ..cuda_kernels import get_extension
+
+            ext = get_extension()
+            return ext.get_scatter_map(
+                int(h),
+                int(w),
+                int(b_size_h),
+                int(b_size_w),
+                int(k_size_h),
+                int(k_size_w),
+                int(offset_h),
+                int(offset_w),
+                int(stride_h),
+                int(stride_w),
+                active_indices.to(dtype=torch.int32).contiguous(),
+            )
+        except Exception:
+            pass
 
     # [N]
     ai_h = active_indices[:, 0].to(torch.int64)
@@ -227,6 +249,49 @@ def _as_5d_broadcastable(v: torch.Tensor, B: int, C: int, T: int, H: int, W: int
     return v.expand(*exp)
 
 
+def _as_5d_broadcastable_contiguous_for_cuda(
+    v: torch.Tensor,
+    B: int,
+    C: int,
+    T: int,
+    H: int,
+    W: int,
+    device,
+    dtype,
+) -> torch.Tensor | None:
+    """
+    Prepare scale/shift for the CUDA extension:
+    - returns a contiguous 5D tensor with broadcastable shape (no `expand()` views).
+    - supports: scalar, [C], [B,C], [B,C,T], [B,C,H,W], [B,C,T,H,W]
+    """
+    if v is None:
+        return None
+    if not torch.is_tensor(v):
+        v = torch.tensor(v, device=device, dtype=dtype)
+    if v.device != device:
+        v = v.to(device)
+    if v.dtype != dtype:
+        v = v.to(dtype)
+
+    if v.dim() == 0:  # []
+        v = v.view(1, 1, 1, 1, 1)
+    elif v.dim() == 1:  # [C]
+        v = v.view(1, C, 1, 1, 1)
+    elif v.dim() == 2:  # [B,C] or [1,C]
+        v = v.view(v.size(0), v.size(1), 1, 1, 1)
+    elif v.dim() == 3:  # [B,C,T]
+        v = v.view(v.size(0), v.size(1), v.size(2), 1, 1)
+    elif v.dim() == 4:  # [B,C,H,W]
+        v = v.unsqueeze(2)  # -> [B,C,1,H,W]
+    elif v.dim() == 5:  # [B,C,T,H,W]
+        pass
+    else:
+        raise ValueError(f"scale/shift dim not supported: {tuple(v.shape)}")
+
+    # Avoid passing expanded views to the extension (it assumes contiguous indexing).
+    return v.contiguous()
+
+
 def scatter_gather3d(
     x: torch.Tensor,                 # [B*num_active, C, T, Rx, Sx]
     y: torch.Tensor,                 # [B, C, T, H, W]
@@ -251,6 +316,70 @@ def scatter_gather3d(
 
     if num_active == 0:
         return x.new_zeros((0, C, T, Ro, So))
+
+    if x.is_cuda and use_cuda_kernels():
+        try:
+            from ..cuda_kernels import get_extension
+
+            ext = get_extension()
+            device = x.device
+            dtype = x.dtype
+
+            active_indices_cuda = active_indices.to(device=device, dtype=torch.int32).contiguous()
+            scatter_map_cuda = scatter_map.to(device=device, dtype=torch.int32).contiguous()
+
+            if rms_norm_fn is None:
+                scale_cuda = _as_5d_broadcastable_contiguous_for_cuda(scale, B, C, T, H, W, device, dtype)
+                shift_cuda = _as_5d_broadcastable_contiguous_for_cuda(shift, B, C, T, H, W, device, dtype)
+                return ext.scatter_gather3d(
+                    x.contiguous(),
+                    y.contiguous(),
+                    int(Ro),
+                    int(So),
+                    active_indices_cuda,
+                    scatter_map_cuda,
+                    scale_cuda,
+                    shift_cuda,
+                    activation_name,
+                    activation_first,
+                )
+
+            # RMSNorm path: fully fused in CUDA (x/y selection + RMSNorm + scale/shift + activation).
+            norm_module = getattr(rms_norm_fn, "__self__", None)
+            if norm_module is not None and hasattr(ext, "scatter_gather3d_rmsnorm"):
+                if not bool(getattr(norm_module, "channel_first", True)):
+                    raise RuntimeError("CUDA RMSNorm path requires channel_first=True")
+                eps = float(getattr(norm_module, "eps", 1e-6))
+                gamma = getattr(norm_module, "gamma", None)
+                if gamma is None:
+                    raise RuntimeError("rms_norm_fn has no gamma parameter")
+
+                bias = getattr(norm_module, "bias", None)
+                bias_tensor = bias if torch.is_tensor(bias) else None
+
+                gamma_cuda = gamma.to(device=device, dtype=dtype).reshape(-1).contiguous()
+                bias_cuda = None if bias_tensor is None else bias_tensor.to(device=device, dtype=dtype).reshape(-1).contiguous()
+
+                scale_cuda = _as_5d_broadcastable_contiguous_for_cuda(scale, B, C, T, H, W, device, dtype)
+                shift_cuda = _as_5d_broadcastable_contiguous_for_cuda(shift, B, C, T, H, W, device, dtype)
+
+                return ext.scatter_gather3d_rmsnorm(
+                    x.contiguous(),
+                    y.contiguous(),
+                    int(Ro),
+                    int(So),
+                    active_indices_cuda,
+                    scatter_map_cuda,
+                    gamma_cuda,
+                    bias_cuda,
+                    eps,
+                    scale_cuda,
+                    shift_cuda,
+                    activation_name,
+                    activation_first,
+                )
+        except Exception:
+            pass
 
     device = x.device
     dtype = x.dtype

@@ -121,7 +121,7 @@ class Gather3d(SIGEModule3d):
                 self.activation_name,
                 self.activation_first,
                 rms_norm_fn=self.rms_norm_fn,   # ✅ 改名，传函数
-                is_cache_gather=is_cache_gather # 不需要norm和激活  
+                is_cache_gather=is_cache_gather # 不需要norm和激活
             )
 
         raise NotImplementedError(f"Unknown mode: {self.mode}")
