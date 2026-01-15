@@ -913,6 +913,7 @@ def main():
     video_path = "assets/input.mp4"
     out_path = "assets/recon.mp4"
 
+    # input_video_original, original_fps = load_mp4_as_tensor(video_path, max_frames=20, resize_hw=(480, 832))
     input_video_original, original_fps = load_mp4_as_tensor(video_path, resize_hw=(480, 832))
     input_video_original = input_video_original.unsqueeze(0).to(device=device, dtype=dtype)
 

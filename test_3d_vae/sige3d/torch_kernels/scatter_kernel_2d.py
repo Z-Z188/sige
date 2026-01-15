@@ -176,7 +176,8 @@ def scatter2d(
             pass
 
     # 不能直接修改y：必须保持不变（full 前向算出来的 pre-computed 底图）
-    output = y.clone()
+    # output = y.clone()
+    output = y
     device = output.device
     dtype = output.dtype
 

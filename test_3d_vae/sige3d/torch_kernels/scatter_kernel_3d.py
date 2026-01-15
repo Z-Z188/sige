@@ -198,7 +198,8 @@ def scatter3d(
         except Exception:
             pass
 
-    output = y.clone()
+    # output = y.clone()
+    output = y
     device = output.device
     dtype = output.dtype
 

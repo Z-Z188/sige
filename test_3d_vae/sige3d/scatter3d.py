@@ -25,11 +25,12 @@ class Scatter3d(SIGEModule3d):
         将 original_outputs 中的缓存特征按 flow 做反向采样（backward warp）+ 双线性插值
         - 输入缓存: [B, C, T, H, W]
         - flow: [H, W, 2]，每个位置是 (dx, dy)（像素位移，允许非整数）
+          - 允许传入与缓存分辨率不同的 flow：会在 `forward_warp_cache_5d()` 内部按比例 resize + 缩放位移
         - 输出：同形状，output[..., y, x] 从 input[..., y+dy, x+dx] 采样（越界按 0 填充）
         - 对每个时间帧 T 做同样的空间采样（flow 仅依赖 H,W）
         """
-
         self.original_outputs = forward_warp_cache_5d(self.original_outputs, flow).contiguous()
+
 
 
     def forward(self, x: torch.Tensor, residual: Optional[torch.Tensor] = None) -> torch.Tensor:
@@ -73,6 +74,8 @@ class Scatter3d(SIGEModule3d):
                 active_indices.contiguous(),
                 None if residual is None else residual.contiguous(),
             )
+            # self.original_outputs.copy_(output.contiguous())
+
             if self.sparse_update:
                 self.original_outputs.copy_(output.contiguous())
             return output
@@ -135,19 +138,30 @@ class ScatterWithBlockResidual3d(SIGEModule3d):
                 self.shortcut_gather.module.active_indices.contiguous(),
             )
 
-            if self.sparse_update:
-                self.original_outputs.copy_(output.contiguous())
-                updated_residual = scatter3d(
-                    residual.contiguous(),
-                    self.original_residuals.contiguous(),
-                    self.shortcut_gather.module.offset[0],
-                    self.shortcut_gather.module.offset[1],
-                    self.shortcut_gather.module.model_stride[0],
-                    self.shortcut_gather.module.model_stride[1],
-                    self.shortcut_gather.module.active_indices.contiguous(),
-                    None,
-                )
-                self.original_residuals.copy_(updated_residual.contiguous())
+            updated_residual = scatter3d(
+                residual.contiguous(),
+                self.original_residuals.contiguous(),
+                self.shortcut_gather.module.offset[0],
+                self.shortcut_gather.module.offset[1],
+                self.shortcut_gather.module.model_stride[0],
+                self.shortcut_gather.module.model_stride[1],
+                self.shortcut_gather.module.active_indices.contiguous(),
+                None,
+            )
+            
+            # if self.sparse_update:
+            #     self.original_outputs.copy_(output.contiguous())
+            #     updated_residual = scatter3d(
+            #         residual.contiguous(),
+            #         self.original_residuals.contiguous(),
+            #         self.shortcut_gather.module.offset[0],
+            #         self.shortcut_gather.module.offset[1],
+            #         self.shortcut_gather.module.model_stride[0],
+            #         self.shortcut_gather.module.model_stride[1],
+            #         self.shortcut_gather.module.active_indices.contiguous(),
+            #         None,
+            #     )
+            #     self.original_residuals.copy_(updated_residual.contiguous())
             return output
 
         raise NotImplementedError(f"Unknown mode: {self.mode}")

@@ -16,8 +16,7 @@ __global__ void gather3d_cuda_kernel(
         const scalar_t *__restrict__ shift,
         int shiftB, int shiftC, int shiftT, int shiftH, int shiftW,
         ActivationType activationType,
-        bool activationFirst
-) {
+        bool activationFirst) {
     index_t index = static_cast<index_t>(blockIdx.x) * static_cast<index_t>(blockDim.x) + static_cast<index_t>(threadIdx.x);
     if (index >= total)
         return;
@@ -68,8 +67,7 @@ torch::Tensor gather3d_cuda(
         const torch::optional<torch::Tensor> &scale,
         const torch::optional<torch::Tensor> &shift,
         const std::string &activationName = std::string("identity"),
-        bool activationFirst = false
-) {
+        bool activationFirst = false) {
     TORCH_CHECK(x.is_cuda(), "gather3d_cuda: x must be CUDA");
     TORCH_CHECK(x.dim() == 5, "gather3d_cuda: x must be 5D [B,C,T,H,W]");
     TORCH_CHECK(activeIndices.is_cuda(), "gather3d_cuda: activeIndices must be CUDA");
@@ -164,6 +162,7 @@ torch::Tensor gather3d_cuda(
     return output;
 }
 
+
 namespace {
 
 constexpr int rms_norm_threads = 256;
@@ -184,8 +183,7 @@ __global__ void gather3d_rmsnorm_cuda_kernel(
         int scaleB, int scaleC, int scaleT, int scaleH, int scaleW,
         const scalar_t *__restrict__ shift,
         int shiftB, int shiftC, int shiftT, int shiftH, int shiftW,
-        ActivationType activationType
-) {
+        ActivationType activationType) {
     const int64_t vec = static_cast<int64_t>(blockIdx.x);
     if (vec >= numVecs) {
         return;
@@ -285,8 +283,7 @@ torch::Tensor gather3d_rmsnorm_cuda(
         double eps,
         const torch::optional<torch::Tensor> &scale,
         const torch::optional<torch::Tensor> &shift,
-        const std::string &activationName = std::string("identity")
-) {
+        const std::string &activationName = std::string("identity")) {
     TORCH_CHECK(x.is_cuda(), "gather3d_rmsnorm_cuda: x must be CUDA");
     TORCH_CHECK(x.dim() == 5, "gather3d_rmsnorm_cuda: x must be 5D [B,C,T,H,W]");
     TORCH_CHECK(activeIndices.is_cuda(), "gather3d_rmsnorm_cuda: activeIndices must be CUDA");
@@ -393,19 +390,19 @@ torch::Tensor gather3d_rmsnorm_cuda(
     return output;
 }
 
-template <typename scalar_t, typename index_t>
+template <typename scalar_t, typename index_t, bool residualIsFull, bool outputIndex32>
 __global__ void scatter3d_cuda_kernel(
         index_t total, int numActive,
         int B, int C, int T, int H, int W,
         int R, int S,
         int offsetH, int offsetW,
         int strideH, int strideW,
+        int strideHShift, int strideWShift,
         const scalar_t *__restrict__ x,
         scalar_t *__restrict__ output,
         const int *__restrict__ activeIndices,
         const scalar_t *__restrict__ residual,
-        int residualB, int residualC, int residualT, int residualH, int residualW
-) {
+        int residualB, int residualC, int residualT, int residualH, int residualW) {
     index_t index = static_cast<index_t>(blockIdx.x) * static_cast<index_t>(blockDim.x) + static_cast<index_t>(threadIdx.x);
     if (index >= total)
         return;
@@ -422,22 +419,58 @@ __global__ void scatter3d_cuda_kernel(
     int ib = static_cast<int>(t % numActive);
     int bb = static_cast<int>(t / numActive);
 
-    int biH = (offsetH + activeIndices[ib << 1]) / strideH;
+    int biH = 0, biW = 0;
+#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 700)
+    const int lane = static_cast<int>(threadIdx.x) & 31;
+    const unsigned int mask = __match_any_sync(0xffffffffu, ib);
+    const int leader = __ffs(mask) - 1;
+
+    int biHTmp = 0, biWTmp = 0;
+    if (lane == leader) {
+        const int aiH = activeIndices[ib << 1];
+        const int aiW = activeIndices[ib << 1 | 1];
+        const int offH = offsetH + aiH;
+        const int offW = offsetW + aiW;
+        biHTmp = (strideHShift >= 0) ? (offH >> strideHShift) : (offH / strideH);
+        biWTmp = (strideWShift >= 0) ? (offW >> strideWShift) : (offW / strideW);
+    }
+    biH = __shfl_sync(mask, biHTmp, leader);
+    biW = __shfl_sync(mask, biWTmp, leader);
+#else
+    biH = (strideHShift >= 0) ? ((offsetH + activeIndices[ib << 1]) >> strideHShift)
+                              : ((offsetH + activeIndices[ib << 1]) / strideH);
+    biW = (strideWShift >= 0) ? ((offsetW + activeIndices[ib << 1 | 1]) >> strideWShift)
+                              : ((offsetW + activeIndices[ib << 1 | 1]) / strideW);
+#endif
+
     int hh = biH + intraBh;
     if (hh >= H)
         return;
-    int biW = (offsetW + activeIndices[ib << 1 | 1]) / strideW;
     int ww = biW + intraBw;
     if (ww >= W)
         return;
 
-    int64_t p = ((static_cast<int64_t>(bb) * C + cc) * T + tt) * H * W + static_cast<int64_t>(hh) * W + ww;
     float z = to_float(x[index]);
-    z = binary_op_array_cuda_5d<ADD>(residual, z, residualB, residualC, residualT, residualH, residualW, bb, cc, tt, hh, ww);
-    output[p] = from_float<scalar_t>(z);
+    if (outputIndex32) {
+        const int p = ((bb * C + cc) * T + tt) * H * W + hh * W + ww;
+        if (residualIsFull) {
+            z += to_float(residual[p]);
+        } else {
+            z = binary_op_array_cuda_5d<ADD>(residual, z, residualB, residualC, residualT, residualH, residualW, bb, cc, tt, hh, ww);
+        }
+        output[p] = from_float<scalar_t>(z);
+    } else {
+        const int64_t p = ((static_cast<int64_t>(bb) * C + cc) * T + tt) * H * W + static_cast<int64_t>(hh) * W + ww;
+        if (residualIsFull) {
+            z += to_float(residual[p]);
+        } else {
+            z = binary_op_array_cuda_5d<ADD>(residual, z, residualB, residualC, residualT, residualH, residualW, bb, cc, tt, hh, ww);
+        }
+        output[p] = from_float<scalar_t>(z);
+    }
 }
 
-template <typename scalar_t, typename index_t>
+template <typename scalar_t, typename index_t, bool outputIndex32>
 __global__ void calibrate_residual3d_cuda_kernel(
         index_t total, int numActive,
         int B, int C, int T, int H, int W,
@@ -445,8 +478,7 @@ __global__ void calibrate_residual3d_cuda_kernel(
         const scalar_t *__restrict__ x,
         const scalar_t *__restrict__ y,
         scalar_t *__restrict__ output,
-        const int *__restrict__ activeIndices
-) {
+        const int *__restrict__ activeIndices) {
     index_t index = static_cast<index_t>(blockIdx.x) * static_cast<index_t>(blockDim.x) + static_cast<index_t>(threadIdx.x);
     if (index >= total)
         return;
@@ -463,19 +495,42 @@ __global__ void calibrate_residual3d_cuda_kernel(
     int ib = static_cast<int>(t % numActive);
     int bb = static_cast<int>(t / numActive);
 
-    int biH = activeIndices[ib << 1];
+    int biH = 0, biW = 0;
+#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 700)
+    const int lane = static_cast<int>(threadIdx.x) & 31;
+    const unsigned int mask = __match_any_sync(0xffffffffu, ib);
+    const int leader = __ffs(mask) - 1;
+
+    int biHTmp = 0, biWTmp = 0;
+    if (lane == leader) {
+        biHTmp = activeIndices[ib << 1];
+        biWTmp = activeIndices[ib << 1 | 1];
+    }
+    biH = __shfl_sync(mask, biHTmp, leader);
+    biW = __shfl_sync(mask, biWTmp, leader);
+#else
+    biH = activeIndices[ib << 1];
+    biW = activeIndices[ib << 1 | 1];
+#endif
+
     int hh = biH + intraBh;
     if (hh >= H)
         return;
-    int biW = activeIndices[ib << 1 | 1];
     int ww = biW + intraBw;
     if (ww >= W)
         return;
 
-    int64_t p = ((static_cast<int64_t>(bb) * C + cc) * T + tt) * H * W + static_cast<int64_t>(hh) * W + ww;
-    float cur = to_float(output[p]);
-    cur += to_float(x[index]) - to_float(y[p]);
-    output[p] = from_float<scalar_t>(cur);
+    if (outputIndex32) {
+        const int p = ((bb * C + cc) * T + tt) * H * W + hh * W + ww;
+        float cur = to_float(output[p]);
+        cur += to_float(x[index]) - to_float(y[p]);
+        output[p] = from_float<scalar_t>(cur);
+    } else {
+        const int64_t p = ((static_cast<int64_t>(bb) * C + cc) * T + tt) * H * W + static_cast<int64_t>(hh) * W + ww;
+        float cur = to_float(output[p]);
+        cur += to_float(x[index]) - to_float(y[p]);
+        output[p] = from_float<scalar_t>(cur);
+    }
 }
 
 torch::Tensor scatter3d_cuda(
@@ -484,8 +539,7 @@ torch::Tensor scatter3d_cuda(
         int offsetH, int offsetW,
         int strideH, int strideW,
         const torch::Tensor &activeIndices,
-        const torch::optional<torch::Tensor> &residual
-) {
+        const torch::optional<torch::Tensor> &residual) {
     TORCH_CHECK(x.is_cuda() && y.is_cuda(), "scatter3d_cuda: x/y must be CUDA");
     TORCH_CHECK(x.dim() == 5, "scatter3d_cuda: x must be 5D [B*numActive,C,T,R,S]");
     TORCH_CHECK(y.dim() == 5, "scatter3d_cuda: y must be 5D [B,C,T,H,W]");
@@ -513,6 +567,16 @@ torch::Tensor scatter3d_cuda(
     const int S = static_cast<int>(x.size(4));
 
     const int *activeIndicesData = activeIndices.data_ptr<int>();
+    const bool outputIndex32 = (y.numel() <= static_cast<int64_t>(std::numeric_limits<int>::max()));
+
+    auto stride_shift_or_neg1 = [](int stride) -> int {
+        if (stride <= 0) return -1;
+        const unsigned int u = static_cast<unsigned int>(stride);
+        if ((u & (u - 1)) != 0) return -1;
+        return __builtin_ctz(u);
+    };
+    const int strideHShift = stride_shift_or_neg1(strideH);
+    const int strideWShift = stride_shift_or_neg1(strideW);
 
     AT_DISPATCH_FLOATING_TYPES_AND2(
             at::ScalarType::Half,
@@ -525,6 +589,7 @@ torch::Tensor scatter3d_cuda(
 
                 const scalar_t *residualData = nullptr;
                 int residualB = 0, residualC = 0, residualT = 0, residualH = 0, residualW = 0;
+                bool residualIsFull = false;
                 if (residual.has_value()) {
                     TORCH_CHECK(residual.value().is_cuda(), "scatter3d_cuda: residual must be CUDA");
                     TORCH_CHECK(residual.value().scalar_type() == x.scalar_type(), "scatter3d_cuda: residual dtype must match x");
@@ -536,34 +601,121 @@ torch::Tensor scatter3d_cuda(
                     residualT = static_cast<int>(residual.value().size(2));
                     residualH = static_cast<int>(residual.value().size(3));
                     residualW = static_cast<int>(residual.value().size(4));
+                    residualIsFull = (residualB == B) && (residualC == C) && (residualT == T) && (residualH == H) && (residualW == W);
                 }
 
                 const int64_t total = x.numel();
                 if (total <= static_cast<int64_t>(std::numeric_limits<int>::max())) {
                     const int total32 = static_cast<int>(total);
                     const dim3 blocks(static_cast<unsigned int>((total32 + threads - 1) / threads), 1, 1);
-                    scatter3d_cuda_kernel<scalar_t, int><<<blocks, threads>>>(
-                            total32, numActive,
-                            B, C, T, H, W,
-                            R, S,
-                            offsetH, offsetW,
-                            strideH, strideW,
-                            xData, outputData,
-                            activeIndicesData,
-                            residualData,
-                            residualB, residualC, residualT, residualH, residualW);
+                    if (outputIndex32) {
+                        if (residualIsFull) {
+                            scatter3d_cuda_kernel<scalar_t, int, true, true><<<blocks, threads>>>(
+                                    total32, numActive,
+                                    B, C, T, H, W,
+                                    R, S,
+                                    offsetH, offsetW,
+                                    strideH, strideW,
+                                    strideHShift, strideWShift,
+                                    xData, outputData,
+                                    activeIndicesData,
+                                    residualData,
+                                    residualB, residualC, residualT, residualH, residualW);
+                        } else {
+                            scatter3d_cuda_kernel<scalar_t, int, false, true><<<blocks, threads>>>(
+                                    total32, numActive,
+                                    B, C, T, H, W,
+                                    R, S,
+                                    offsetH, offsetW,
+                                    strideH, strideW,
+                                    strideHShift, strideWShift,
+                                    xData, outputData,
+                                    activeIndicesData,
+                                    residualData,
+                                    residualB, residualC, residualT, residualH, residualW);
+                        }
+                    } else {
+                        if (residualIsFull) {
+                            scatter3d_cuda_kernel<scalar_t, int, true, false><<<blocks, threads>>>(
+                                    total32, numActive,
+                                    B, C, T, H, W,
+                                    R, S,
+                                    offsetH, offsetW,
+                                    strideH, strideW,
+                                    strideHShift, strideWShift,
+                                    xData, outputData,
+                                    activeIndicesData,
+                                    residualData,
+                                    residualB, residualC, residualT, residualH, residualW);
+                        } else {
+                            scatter3d_cuda_kernel<scalar_t, int, false, false><<<blocks, threads>>>(
+                                    total32, numActive,
+                                    B, C, T, H, W,
+                                    R, S,
+                                    offsetH, offsetW,
+                                    strideH, strideW,
+                                    strideHShift, strideWShift,
+                                    xData, outputData,
+                                    activeIndicesData,
+                                    residualData,
+                                    residualB, residualC, residualT, residualH, residualW);
+                        }
+                    }
                 } else {
                     const dim3 blocks(static_cast<unsigned int>((total + threads - 1) / threads), 1, 1);
-                    scatter3d_cuda_kernel<scalar_t, int64_t><<<blocks, threads>>>(
-                            total, numActive,
-                            B, C, T, H, W,
-                            R, S,
-                            offsetH, offsetW,
-                            strideH, strideW,
-                            xData, outputData,
-                            activeIndicesData,
-                            residualData,
-                            residualB, residualC, residualT, residualH, residualW);
+                    if (outputIndex32) {
+                        if (residualIsFull) {
+                            scatter3d_cuda_kernel<scalar_t, int64_t, true, true><<<blocks, threads>>>(
+                                    total, numActive,
+                                    B, C, T, H, W,
+                                    R, S,
+                                    offsetH, offsetW,
+                                    strideH, strideW,
+                                    strideHShift, strideWShift,
+                                    xData, outputData,
+                                    activeIndicesData,
+                                    residualData,
+                                    residualB, residualC, residualT, residualH, residualW);
+                        } else {
+                            scatter3d_cuda_kernel<scalar_t, int64_t, false, true><<<blocks, threads>>>(
+                                    total, numActive,
+                                    B, C, T, H, W,
+                                    R, S,
+                                    offsetH, offsetW,
+                                    strideH, strideW,
+                                    strideHShift, strideWShift,
+                                    xData, outputData,
+                                    activeIndicesData,
+                                    residualData,
+                                    residualB, residualC, residualT, residualH, residualW);
+                        }
+                    } else {
+                        if (residualIsFull) {
+                            scatter3d_cuda_kernel<scalar_t, int64_t, true, false><<<blocks, threads>>>(
+                                    total, numActive,
+                                    B, C, T, H, W,
+                                    R, S,
+                                    offsetH, offsetW,
+                                    strideH, strideW,
+                                    strideHShift, strideWShift,
+                                    xData, outputData,
+                                    activeIndicesData,
+                                    residualData,
+                                    residualB, residualC, residualT, residualH, residualW);
+                        } else {
+                            scatter3d_cuda_kernel<scalar_t, int64_t, false, false><<<blocks, threads>>>(
+                                    total, numActive,
+                                    B, C, T, H, W,
+                                    R, S,
+                                    offsetH, offsetW,
+                                    strideH, strideW,
+                                    strideHShift, strideWShift,
+                                    xData, outputData,
+                                    activeIndicesData,
+                                    residualData,
+                                    residualB, residualC, residualT, residualH, residualW);
+                        }
+                    }
                 }
             });
 
@@ -576,8 +728,7 @@ torch::Tensor scatter_with_block_residual3d_cuda(
         int offsetH, int offsetW,
         int strideH, int strideW,
         const torch::Tensor &activeIndices0,
-        const torch::Tensor &activeIndices1
-) {
+        const torch::Tensor &activeIndices1) {
     auto output = scatter3d_cuda(x0, y0, offsetH, offsetW, strideH, strideW, activeIndices0, y1);
     if (x1.numel() == 0 || activeIndices1.numel() == 0) {
         return output;
@@ -603,6 +754,7 @@ torch::Tensor scatter_with_block_residual3d_cuda(
     const int S = static_cast<int>(x1.size(4));
 
     const int *activeIndicesData = activeIndices1.data_ptr<int>();
+    const bool outputIndex32 = (y1.numel() <= static_cast<int64_t>(std::numeric_limits<int>::max()));
 
     AT_DISPATCH_FLOATING_TYPES_AND2(
             at::ScalarType::Half,
@@ -618,22 +770,42 @@ torch::Tensor scatter_with_block_residual3d_cuda(
                 if (total <= static_cast<int64_t>(std::numeric_limits<int>::max())) {
                     const int total32 = static_cast<int>(total);
                     const dim3 blocks(static_cast<unsigned int>((total32 + threads - 1) / threads), 1, 1);
-                    calibrate_residual3d_cuda_kernel<scalar_t, int><<<blocks, threads>>>(
-                            total32, numActive,
-                            B, C, T, H, W,
-                            R, S,
-                            x1Data, y1Data,
-                            outputData,
-                            activeIndicesData);
+                    if (outputIndex32) {
+                        calibrate_residual3d_cuda_kernel<scalar_t, int, true><<<blocks, threads>>>(
+                                total32, numActive,
+                                B, C, T, H, W,
+                                R, S,
+                                x1Data, y1Data,
+                                outputData,
+                                activeIndicesData);
+                    } else {
+                        calibrate_residual3d_cuda_kernel<scalar_t, int, false><<<blocks, threads>>>(
+                                total32, numActive,
+                                B, C, T, H, W,
+                                R, S,
+                                x1Data, y1Data,
+                                outputData,
+                                activeIndicesData);
+                    }
                 } else {
                     const dim3 blocks(static_cast<unsigned int>((total + threads - 1) / threads), 1, 1);
-                    calibrate_residual3d_cuda_kernel<scalar_t, int64_t><<<blocks, threads>>>(
-                            total, numActive,
-                            B, C, T, H, W,
-                            R, S,
-                            x1Data, y1Data,
-                            outputData,
-                            activeIndicesData);
+                    if (outputIndex32) {
+                        calibrate_residual3d_cuda_kernel<scalar_t, int64_t, true><<<blocks, threads>>>(
+                                total, numActive,
+                                B, C, T, H, W,
+                                R, S,
+                                x1Data, y1Data,
+                                outputData,
+                                activeIndicesData);
+                    } else {
+                        calibrate_residual3d_cuda_kernel<scalar_t, int64_t, false><<<blocks, threads>>>(
+                                total, numActive,
+                                B, C, T, H, W,
+                                R, S,
+                                x1Data, y1Data,
+                                outputData,
+                                activeIndicesData);
+                    }
                 }
             });
 
@@ -656,8 +828,7 @@ __global__ void scatter_gather3d_cuda_kernel(
         const scalar_t *__restrict__ shift,
         int shiftB, int shiftC, int shiftT, int shiftH, int shiftW,
         ActivationType activationType,
-        bool activationFirst
-) {
+        bool activationFirst) {
     index_t index = static_cast<index_t>(blockIdx.x) * static_cast<index_t>(blockDim.x) + static_cast<index_t>(threadIdx.x);
     if (index >= total)
         return;
@@ -724,8 +895,7 @@ torch::Tensor scatter_gather3d_cuda(
         const torch::optional<torch::Tensor> &scale,
         const torch::optional<torch::Tensor> &shift,
         const std::string &activationName = std::string("identity"),
-        bool activationFirst = false
-) {
+        bool activationFirst = false) {
     TORCH_CHECK(x.is_cuda() && y.is_cuda(), "scatter_gather3d_cuda: x/y must be CUDA");
     TORCH_CHECK(x.dim() == 5 && y.dim() == 5, "scatter_gather3d_cuda: x/y must be 5D");
     TORCH_CHECK(x.scalar_type() == y.scalar_type(), "scatter_gather3d_cuda: x/y dtype must match");
@@ -856,8 +1026,7 @@ __global__ void scatter_gather3d_rmsnorm_cuda_kernel(
         const scalar_t *__restrict__ shift,
         int shiftB, int shiftC, int shiftT, int shiftH, int shiftW,
         ActivationType activationType,
-        bool activationFirst
-) {
+        bool activationFirst) {
     const int64_t vec = static_cast<int64_t>(blockIdx.x);
     if (vec >= numVecs) {
         return;
@@ -984,8 +1153,7 @@ torch::Tensor scatter_gather3d_rmsnorm_cuda(
         const torch::optional<torch::Tensor> &scale,
         const torch::optional<torch::Tensor> &shift,
         const std::string &activationName = std::string("identity"),
-        bool activationFirst = false
-) {
+        bool activationFirst = false) {
     TORCH_CHECK(x.is_cuda() && y.is_cuda(), "scatter_gather3d_rmsnorm_cuda: x/y must be CUDA");
     TORCH_CHECK(x.dim() == 5 && y.dim() == 5, "scatter_gather3d_rmsnorm_cuda: x/y must be 5D");
     TORCH_CHECK(x.scalar_type() == y.scalar_type(), "scatter_gather3d_rmsnorm_cuda: x/y dtype must match");

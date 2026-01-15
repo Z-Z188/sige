@@ -46,22 +46,40 @@ def make_step_translation_video(
     M = np.array([[1, 0, dx],
                   [0, 1, dy]], dtype=np.float32)
 
-    def do_move_step(img):
-        return cv2.warpAffine(
-            img,
-            M,
-            (W, H),
-            flags=cv2.INTER_NEAREST,
-            borderMode=cv2.BORDER_CONSTANT,
-            borderValue=fill_bgr,
-        )
 
+    # fill_colors = [
+    #     (0,   0, 255),   # 红
+    #     (0, 255,   0),   # 绿
+    #     (255, 0,   0),   # 蓝
+    #     (0, 255, 255),   # 黄
+    #     (255, 0, 255),   # 紫
+    #     (255, 255, 0),   # 青
+    # ]
+    fill_colors = [
+        (0,   0, 255),   # 红
+        (0, 255,   0),   # 绿
+        (255, 0,   0),   # 蓝
+    ]
+
+    def do_move_step(img): return cv2.warpAffine( img, M, (W, H), flags=cv2.INTER_NEAREST, borderMode=cv2.BORDER_CONSTANT, borderValue=fill_bgr, )
+
+    move_counter = 0
     # 生成视频帧：动/静
     for t in range(1, T):
         # t=1, 1+block_size, 1+2*block_size, ... 发生移动
         if t >= first_move_at and ((t - first_move_at) % block_size == 0):
-            video[t] = do_move_step(video[t - 1])
-            fill_bgr = (255, 0, 0)
+           video[t] = do_move_step(video[t - 1])
+           fill_bgr = (255, 0, 0)
+            # color = fill_colors[move_counter % len(fill_colors)]
+            # video[t] = cv2.warpAffine(
+            #     video[t - 1],
+            #     M,
+            #     (W, H),
+            #     flags=cv2.INTER_NEAREST,
+            #     borderMode=cv2.BORDER_CONSTANT,
+            #     borderValue=color,
+            # )
+            # move_counter += 1
         else:
             video[t] = video[t - 1]  # 静止：直接拷贝上一帧
 

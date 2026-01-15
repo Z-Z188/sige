@@ -156,4 +156,3 @@ def compute_sdedit_masks(
     masks_dec = downsample_mask(diff_dec, min_res=min_res, dilation=0)
 
     return masks_enc, masks_dec, diff_mask
-

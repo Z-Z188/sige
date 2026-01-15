@@ -40,12 +40,11 @@ def normalize_flow(flow: torch.Tensor, h: int, w: int, *, device: torch.device) 
     flow_rs = F.interpolate(flow_chw, size=(h, w), mode="bilinear", align_corners=True)
 
     # Keep displacement in pixel units after resizing.
-    if h0 > 1 and w0 > 1 and h > 1 and w > 1:
-        flow_rs[:, 0].mul_((w - 1) / (w0 - 1))
-        flow_rs[:, 1].mul_((h - 1) / (h0 - 1))
-    else:
-        flow_rs[:, 0].mul_(w / max(w0, 1))
-        flow_rs[:, 1].mul_(h / max(h0, 1))
+    #
+    # Intuition: if a 480p image moves +10px, then at 240p it should be +5px.
+    # So we scale by the resolution ratio (target / source).
+    flow_rs[:, 0].mul_(float(w) / float(max(w0, 1)))
+    flow_rs[:, 1].mul_(float(h) / float(max(h0, 1)))
 
     return flow_rs[0].permute(1, 2, 0).contiguous()
 
@@ -82,14 +81,30 @@ def forward_warp_cache_5d(cache: torch.Tensor, flow: torch.Tensor) -> torch.Tens
 
     # Warp each time slice independently with the same spatial grid.
     cache_2d = cache.permute(0, 2, 1, 3, 4).contiguous().view(b * t, c, h, w)
-    grid_bt = grid.unsqueeze(0).expand(b * t, h, w, 2).to(dtype=cache_2d.dtype)
-    warped = F.grid_sample(
-        cache_2d,
+
+    # grid_bt = grid.unsqueeze(0).expand(b * t, h, w, 2).to(dtype=cache_2d.dtype)
+    # warped = F.grid_sample(
+    #     cache_2d,
+    #     grid_bt,
+    #     mode="bilinear",
+    #     padding_mode="zeros", # 零填充
+    #     align_corners=True,
+    # )
+    # return warped.view(b, t, c, h, w).permute(0, 2, 1, 3, 4).contiguous()
+
+
+    grid_bt = grid.unsqueeze(0).expand(b * t, h, w, 2).to(dtype=torch.float32)
+    cache_2d_f = cache_2d.to(dtype=torch.float32)
+
+    warped_f = F.grid_sample(
+        cache_2d_f,
         grid_bt,
         mode="bilinear",
-        padding_mode="zeros",
+        padding_mode="zeros", # 零填充
         align_corners=True,
     )
+    warped = warped_f.to(dtype=cache_2d.dtype)
+
     return warped.view(b, t, c, h, w).permute(0, 2, 1, 3, 4).contiguous()
 
 
@@ -123,14 +138,26 @@ def forward_warp_cache_4d(cache: torch.Tensor, flow: torch.Tensor) -> torch.Tens
     y_grid = 2.0 * sample_y / h_denom - 1.0
     grid = torch.stack([x_grid, y_grid], dim=-1)  # (H,W,2)
 
-    # Expand to batch.
-    grid_b = grid.unsqueeze(0).expand(b, h, w, 2).to(dtype=cache.dtype)
+    # # Expand to batch.
+    # grid_b = grid.unsqueeze(0).expand(b, h, w, 2).to(dtype=cache.dtype)
 
-    warped = F.grid_sample(
-        cache,
+    # warped = F.grid_sample(
+    #     cache,
+    #     grid_b,
+    #     mode="bilinear",
+    #     padding_mode="zeros",
+    #     align_corners=True,
+    # )
+    # return warped
+
+
+    grid_b = grid.unsqueeze(0).expand(b, h, w, 2).to(dtype=torch.float32)
+    cache_f = cache.to(dtype=torch.float32)
+    warped_f = F.grid_sample(
+        cache_f,
         grid_b,
         mode="bilinear",
         padding_mode="zeros",
         align_corners=True,
     )
-    return warped
+    return warped_f.to(dtype=cache.dtype)

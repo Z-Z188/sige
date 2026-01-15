@@ -90,16 +90,16 @@ def install_sige_op_time_stats() -> None:
     from sige3d.scatter_gather2d import ScatterGather2d
     from sige3d.scatter_gather3d import ScatterGather3d
 
-    _wrap_module_forward(Gather2d, "gather")
-    _wrap_module_forward(Gather3d, "gather")
+    _wrap_module_forward(Gather2d, "gather2d")
+    _wrap_module_forward(Gather3d, "gather3d")
 
-    _wrap_module_forward(Scatter2d, "scatter")
-    _wrap_module_forward(Scatter3d, "scatter")
-    _wrap_module_forward(ScatterWithBlockResidual2d, "scatter")
-    _wrap_module_forward(ScatterWithBlockResidual3d, "scatter")
+    _wrap_module_forward(Scatter2d, "scatter2d")
+    _wrap_module_forward(Scatter3d, "scatter3d")
+    _wrap_module_forward(ScatterWithBlockResidual2d, "scatter2d")
+    _wrap_module_forward(ScatterWithBlockResidual3d, "scatter3d")
 
-    _wrap_module_forward(ScatterGather2d, "scatter_gather")
-    _wrap_module_forward(ScatterGather3d, "scatter_gather")
+    _wrap_module_forward(ScatterGather2d, "scatter_gather2d")
+    _wrap_module_forward(ScatterGather3d, "scatter_gather3d")
 
 
 def get_sige_op_time_stats() -> Dict[str, Tuple[float, int]]:
@@ -108,7 +108,8 @@ def get_sige_op_time_stats() -> Dict[str, Tuple[float, int]]:
 
 def print_sige_op_time_stats(prefix: str = "[SIGE op time]") -> None:
     stats = get_sige_op_time_stats()
-    keys = ("gather", "scatter", "scatter_gather")
+    keys = ("gather2d", "gather3d", "scatter2d","scatter3d", "scatter_gather2d", "scatter_gather3d")
     for k in keys:
+    # for k in stats.keys():
         total_s, calls = stats.get(k, (0.0, 0))
         print(f"{prefix} {k}: {total_s:.2f}s (calls={calls})")

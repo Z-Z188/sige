@@ -70,7 +70,8 @@ def cuda_time_s(fn, *args, **kwargs):
     end.record()
 
     torch.cuda.synchronize()
-    return start.elapsed_time(end) * 1e-3   # ms -> s
+    # return start.elapsed_time(end) * 1e-3   # ms -> s
+    return start.elapsed_time(end)   # ms
 
 
 class VAEInterface(ABC, torch.nn.Module):
@@ -566,8 +567,7 @@ class ResidualBlock(SIGEModule3d):
         if is_first_frame:
             return self.first_forward(x, feat_cache, feat_idx)
         else:
-            return self.sparse_forward(x, feat_cache, feat_idx)
-        
+            return self.sparse_forward(x, feat_cache, feat_idx)    
 
 class AttentionBlock(nn.Module):
     """
@@ -610,7 +610,6 @@ class AttentionBlock(nn.Module):
         x = rearrange(x, '(b t) c h w-> b c t h w', t=t)
         return x + identity
 
-
 class Encoder3d(SIGEModel3d):
     def __init__(self,
                  dim=128,
@@ -632,8 +631,8 @@ class Encoder3d(SIGEModel3d):
         dims = [dim * u for u in [1] + dim_mult]
         scale = 1.0
 
-        # init block
         # 不进行稀疏计算
+        # CausalConv3d(3, 96, kernel_size=(3, 3, 3), stride=(1, 1, 1))
         self.conv1 = CausalConv3d(3, dims[0], 3, padding=1)
 
         # downsample blocks
@@ -833,8 +832,10 @@ def count_conv3d(model):
             count += 1
     return count
 
-class WanVAE_(nn.Module):
 
+flow_time_enc = []
+flow_time_dec = []
+class WanVAE_(nn.Module):
     def __init__(self,
                  dim=128,
                  z_dim=4,
@@ -908,9 +909,13 @@ class WanVAE_(nn.Module):
                 # print(f"[TIMING] encoder.set_masks = {t:.2f} s")
 
 
-                self.encoder.flow_cache(flow)
+                # self.encoder.flow_cache(flow)
+                t = cuda_time_s(self.encoder.flow_cache, flow)
+                flow_time_enc.append(t)
+
+
                 # 每次稀疏计算之后，把结果写回原图进行覆盖
-                self.encoder.set_sparse_update(True)
+                # self.encoder.set_sparse_update(True)
 
                 self._enc_conv_idx = [0]
                 out.append(self.encoder(
@@ -919,7 +924,7 @@ class WanVAE_(nn.Module):
                     feat_idx=self._enc_conv_idx,
                     ))
             out = torch.cat(out, 2)
-            
+        
         mu, log_var = self.conv1(out).chunk(2, dim=1)
         if scale is not None:
             if isinstance(scale[0], torch.Tensor):
@@ -971,9 +976,13 @@ class WanVAE_(nn.Module):
                 # TODO: 下面传入的mask，是当前chunk相对于上一个chunk，计算得到的，flow也是
                 # 测试的时候mask, flow取得固定值
                 self.decoder.set_masks(mask)
-                self.decoder.flow_cache(flow)
+
+                # self.decoder.flow_cache(flow)
+                t = cuda_time_s(self.decoder.flow_cache, flow)
+                flow_time_dec.append(t)
+
                 # 每次稀疏计算之后，把结果写回原图进行覆盖
-                self.decoder.set_sparse_update(True)
+                # self.decoder.set_sparse_update(True)
 
                 self._dec_conv_idx = [0]
                 out.append(self.decoder(
@@ -1282,6 +1291,11 @@ def _parse_args(argv=None):
         metavar=("H", "W"),
         help="Resize input frames to H W before encoding/decoding.",
     )
+    parser.add_argument(
+        "--max_frames",
+        type=int,
+        default=None,
+    )
     def _kernel_backend(v: str) -> str:
         v = (v or "").strip().lower()
         if v in {"pytorch", "torch"}:
@@ -1291,7 +1305,7 @@ def _parse_args(argv=None):
         raise argparse.ArgumentTypeError("Expected 'PyTorch' or 'CUDA'.")
 
     parser.add_argument(
-        "--sige-kernels",
+        "--sige_kernels",
         type=_kernel_backend,
         default="pytorch",
         help="SIGE gather/scatter kernel backend: PyTorch (default) or CUDA.",
@@ -1318,7 +1332,7 @@ def main(argv=None):
     out_path = args.out
 
     input_video_original, original_fps = load_mp4_as_tensor(
-        video_path, resize_hw=tuple(args.resize_hw)
+        video_path, max_frames=args.max_frames, resize_hw=tuple(args.resize_hw)
     )
     input_video_original = input_video_original.unsqueeze(0).to(device=device, dtype=dtype)
 
@@ -1459,6 +1473,14 @@ def main(argv=None):
     print(f"total avg= {tot_avg:.2f} ms")
 
 
+    # flow_time_enc_avg = np.mean(flow_time_enc)
+    # print(f"flow cache enc call times  = {len(flow_time_enc)}")
+    # print(f"flow cache enc avg  = {flow_time_enc_avg:.2f} ms")
+    # flow_time_dec_avg = np.mean(flow_time_dec)
+    # print(f"flow cache dec call times  = {len(flow_time_dec)}")
+    # print(f"flow cache dec avg  = {flow_time_dec_avg:.2f} ms")
+
+
     video = torch.cat(recon_video_list, dim=1)
 
     video = (video * 0.5 + 0.5).clamp(0, 1)
@@ -1468,15 +1490,15 @@ def main(argv=None):
     torchvision.io.write_video(out_path, video, fps=int(original_fps))
     print("saved to", out_path)
 
-    save_dir = out_path.replace(".mp4", "_frames")
-    os.makedirs(save_dir, exist_ok=True)
+    # save_dir = out_path.replace(".mp4", "_frames")
+    # os.makedirs(save_dir, exist_ok=True)
 
-    for t, frame in enumerate(video):
-        # frame: (H, W, 3), uint8
-        img = Image.fromarray(frame, mode="RGB")
-        img.save(os.path.join(save_dir, f"frame_{t:03d}.png"))
+    # for t, frame in enumerate(video):
+    #     # frame: (H, W, 3), uint8
+    #     img = Image.fromarray(frame, mode="RGB")
+    #     img.save(os.path.join(save_dir, f"frame_{t:03d}.png"))
 
-    print(f"saved {len(video)} frames to {save_dir}")
+    # print(f"saved {len(video)} frames to {save_dir}")
 
 
     # cal PSNR
