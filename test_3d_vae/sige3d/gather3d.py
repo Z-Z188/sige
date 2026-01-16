@@ -74,13 +74,8 @@ class Gather3d(SIGEModule3d):
     def forward(
         self,
         x: torch.Tensor,
-        scale: Optional[torch.Tensor] = None,
-        shift: Optional[torch.Tensor] = None,
         is_cache_gather: Optional[bool] = False,
     ) -> torch.Tensor:
-
-        self.check_dtype(x, scale, shift)
-        self.check_dim(x, scale, shift)
         b, c, t, _, _ = x.shape
 
         if self.mode == "profile":
@@ -92,37 +87,42 @@ class Gather3d(SIGEModule3d):
                 dtype=x.dtype,
                 device=x.device,
             )
-            if scale is not None:
-                output = output * scale.reshape(scale.size(0), scale.size(1), 1, 1, 1).repeat_interleave(
-                    self.active_indices.size(0), dim=0
-                )
-            if shift is not None:
-                output = output + shift.reshape(shift.size(0), shift.size(1), 1, 1, 1).repeat_interleave(
-                    self.active_indices.size(0), dim=0
-                )
             return output
 
         if self.mode == "full":
             self.input_res = (int(x.size(3)), int(x.size(4)))
-            assert scale is None
-            assert shift is None
             return x
 
         if self.mode == "sparse":
             if self.active_indices is None:
                 raise RuntimeError("Active indices are not set for sparse mode.")
+            
+            # torch.cuda.synchronize()
+            # start = torch.cuda.Event(enable_timing=True)
+            # end   = torch.cuda.Event(enable_timing=True)
+            # start.record()
+        
+            # print("gather3d is_contiguous:", x.is_contiguous())
+            x = x.contiguous()
+            self.active_indices = self.active_indices.contiguous()
+            
+            # end.record()
+            # torch.cuda.synchronize()
+            # print(f"gather3d time1111111: {start.elapsed_time(end):.2f} ms")   # ms
+
             return gather3d(
-                x.contiguous(),
+                # x.contiguous(),
+                x,
                 self.block_size[0],
                 self.block_size[1],
-                self.active_indices.contiguous(),
-                None if scale is None else scale.contiguous(),
-                None if shift is None else shift.contiguous(),
+                # self.active_indices.contiguous(),
+                self.active_indices,
                 self.activation_name,
-                self.activation_first,
-                rms_norm_fn=self.rms_norm_fn,   # ✅ 改名，传函数
-                is_cache_gather=is_cache_gather # 不需要norm和激活
+                rms_norm_fn=self.rms_norm_fn,    # ✅ 改名，传函数
+                is_cache_gather=is_cache_gather, # 不需要norm和激活
             )
+
+            
 
         raise NotImplementedError(f"Unknown mode: {self.mode}")
 

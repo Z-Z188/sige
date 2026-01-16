@@ -80,8 +80,8 @@ class SIGEModule3d(nn.Module):
         return runtime_dict
 
 
-    def set_sparse_update(self, sparse_update: bool):
-        self.sparse_update = sparse_update
+    # def set_sparse_update(self, sparse_update: bool):
+        # self.sparse_update = sparse_update
             
 
     def check_dtype(self, *args: Optional[torch.Tensor]):

@@ -82,16 +82,33 @@ def forward_warp_cache_5d(cache: torch.Tensor, flow: torch.Tensor) -> torch.Tens
     # Warp each time slice independently with the same spatial grid.
     cache_2d = cache.permute(0, 2, 1, 3, 4).contiguous().view(b * t, c, h, w)
 
-    # grid_bt = grid.unsqueeze(0).expand(b * t, h, w, 2).to(dtype=cache_2d.dtype)
-    # warped = F.grid_sample(
-    #     cache_2d,
-    #     grid_bt,
-    #     mode="bilinear",
-    #     padding_mode="zeros", # 零填充
-    #     align_corners=True,
-    # )
-    # return warped.view(b, t, c, h, w).permute(0, 2, 1, 3, 4).contiguous()
 
+    grid_bt = grid.unsqueeze(0).expand(b * t, h, w, 2).to(dtype=cache_2d.dtype)
+    
+    # torch.cuda.synchronize()
+    # start = torch.cuda.Event(enable_timing=True)
+    # end   = torch.cuda.Event(enable_timing=True)
+    # start.record()
+
+    warped = F.grid_sample(
+        cache_2d,
+        grid_bt,
+        mode="bilinear",
+        padding_mode="zeros", # 零填充
+        align_corners=True,
+    )
+
+    # end.record()
+    # torch.cuda.synchronize()
+    # print(f"flow bf16: {start.elapsed_time(end):.2f} ms")   # ms
+            
+    return warped.view(b, t, c, h, w).permute(0, 2, 1, 3, 4).contiguous()
+
+
+    # torch.cuda.synchronize()
+    # start = torch.cuda.Event(enable_timing=True)
+    # end   = torch.cuda.Event(enable_timing=True)
+    # start.record()
 
     grid_bt = grid.unsqueeze(0).expand(b * t, h, w, 2).to(dtype=torch.float32)
     cache_2d_f = cache_2d.to(dtype=torch.float32)
@@ -103,6 +120,11 @@ def forward_warp_cache_5d(cache: torch.Tensor, flow: torch.Tensor) -> torch.Tens
         padding_mode="zeros", # 零填充
         align_corners=True,
     )
+
+    # end.record()
+    # torch.cuda.synchronize()
+    # print(f"flow float32: {start.elapsed_time(end):.2f} ms")   # ms
+
     warped = warped_f.to(dtype=cache_2d.dtype)
 
     return warped.view(b, t, c, h, w).permute(0, 2, 1, 3, 4).contiguous()
@@ -138,17 +160,17 @@ def forward_warp_cache_4d(cache: torch.Tensor, flow: torch.Tensor) -> torch.Tens
     y_grid = 2.0 * sample_y / h_denom - 1.0
     grid = torch.stack([x_grid, y_grid], dim=-1)  # (H,W,2)
 
-    # # Expand to batch.
-    # grid_b = grid.unsqueeze(0).expand(b, h, w, 2).to(dtype=cache.dtype)
+    # Expand to batch.
+    grid_b = grid.unsqueeze(0).expand(b, h, w, 2).to(dtype=cache.dtype)
 
-    # warped = F.grid_sample(
-    #     cache,
-    #     grid_b,
-    #     mode="bilinear",
-    #     padding_mode="zeros",
-    #     align_corners=True,
-    # )
-    # return warped
+    warped = F.grid_sample(
+        cache,
+        grid_b,
+        mode="bilinear",
+        padding_mode="zeros",
+        align_corners=True,
+    )
+    return warped
 
 
     grid_b = grid.unsqueeze(0).expand(b, h, w, 2).to(dtype=torch.float32)

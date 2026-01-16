@@ -170,8 +170,8 @@ def make_step_translation_video(
 if __name__ == "__main__":
     video, flow, mask = make_step_translation_video(
         img_path="../assets/input.png",
-        T=205,
-        dx=10,
+        T=125,
+        dx=23,
         dy=0,           # 只向右移动；如果也要向下就改 dy=10
         block_size=4,   # “1,4,4,4...”
         first_move_at=5,

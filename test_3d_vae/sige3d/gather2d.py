@@ -7,6 +7,7 @@ from torch import nn
 from utils.mask_utils import reduce_mask
 from .base import SIGEModule3d
 from .activation import activation
+from .torch_kernels import gather2d
 
 
 class Gather2d(SIGEModule3d):
@@ -22,7 +23,6 @@ class Gather2d(SIGEModule3d):
         block_size: Union[int, Tuple[int, int]],
         offset: Optional[Union[int, Tuple[int, int]]] = None,
         activation_name: str = "identity",
-        activation_first: bool = False,
         verbose: bool = False,
         backend: str = "torch",
     ):
@@ -56,20 +56,15 @@ class Gather2d(SIGEModule3d):
                 offset = (offset, offset)
             self.offset = offset
         self.activation_name = activation_name
-        self.activation_first = activation_first
         self.verbose = verbose
 
-        self.backend = backend
-        self.load_runtime_with_backend("gather2d", backend=self.backend)
+        # self.backend = backend
+        # self.load_runtime_with_backend("gather2d", backend=self.backend)
 
         self.input_res: Optional[Tuple[int, int]] = None
         self.active_indices: Optional[torch.Tensor] = None
 
-    def forward(
-        self, x: torch.Tensor, scale: Optional[torch.Tensor] = None, shift: Optional[torch.Tensor] = None
-    ) -> torch.Tensor:
-        self.check_dtype(x, scale, shift)
-        self.check_dim(x, scale, shift)
+    def forward(self, x: torch.Tensor,) -> torch.Tensor:
         b, c, h, w = x.shape
 
         if self.mode == "profile":
@@ -79,36 +74,56 @@ class Gather2d(SIGEModule3d):
                 dtype=x.dtype,
                 device=x.device,
             )  # create a dummy gather output depending on the input for profiling
-            if scale is not None:
-                output = output * scale[0, 0, 0, 0]
-            if shift is not None:
-                output = output + shift[0, 0, 0, 0]
-            output = activation(output, self.activation_name)
 
         elif self.mode == "full":
             self.input_res = x.shape[2:]
-            assert scale is None
-            assert shift is None
             output = x
             
         elif self.mode == "sparse":
-            device = x.device.type
-            runtime = self.runtime[device]
-            assert runtime is not None
-            active_indices = self.active_indices
-            assert active_indices is not None
-            if self.backend.lower() not in {"torch", "pytorch"} and active_indices.device != x.device:
-                active_indices = active_indices.to(device=x.device)
-            output = runtime(
+            # device = x.device.type
+            # runtime = self.runtime[device]
+            # assert runtime is not None
+            # active_indices = self.active_indices
+            # assert active_indices is not None
+
+
+            # torch.cuda.synchronize()
+            # start = torch.cuda.Event(enable_timing=True)
+            # end   = torch.cuda.Event(enable_timing=True)
+            # start.record()
+
+
+
+            # print("gather2d is_contiguous:", x.is_contiguous())
+            # x = x.contiguous()
+            # self.active_indices = self.active_indices.contiguous()
+            
+            # end.record()
+            # torch.cuda.synchronize()
+            # print(f"gather2d time1111111: {start.elapsed_time(end):.2f} ms")   # ms
+           
+            # print("*" * 40)
+            # torch.cuda.synchronize()
+            # start = torch.cuda.Event(enable_timing=True)
+            # end   = torch.cuda.Event(enable_timing=True)
+            # start.record()
+
+            output = gather2d(
                 x.contiguous(),
+                # x[[0]],
+                # x,
                 self.block_size[0],
                 self.block_size[1],
-                active_indices.contiguous(),
-                None if scale is None else scale.contiguous(),
-                None if shift is None else shift.contiguous(),
-                self.activation_name,
-                self.activation_first,
+                self.active_indices.contiguous(),
+                # self.active_indices,
             )
+
+            # end.record()
+            # torch.cuda.synchronize()
+            # print(f"gather2d time1111111: {start.elapsed_time(end):.2f} ms")   # ms
+            # print("*" * 40)
+            
+            
         else:
             raise NotImplementedError("Unknown mode: [%s]!!!" % self.mode)
         return output
@@ -126,7 +141,7 @@ class Gather2d(SIGEModule3d):
                 active_indices = reduce_mask(
                     mask, self.block_size, self.block_stride, self.offset, verbose=self.verbose
                 )
-                if self.backend.lower() in {"torch", "pytorch"} and active_indices is not None:
-                    active_indices = active_indices.detach().cpu()
+                # if self.backend.lower() in {"torch", "pytorch"} and active_indices is not None:
+                    # active_indices = active_indices.detach().cpu()
                 cache[key] = active_indices
             self.active_indices = active_indices

@@ -134,28 +134,6 @@ class RMS_norm(nn.Module):
         self.bias = nn.Parameter(torch.zeros(shape)) if bias else 0.
 
     def forward(self, x):
-        # NOTE: Use the same kernel backend switch as SIGE gather/scatter ops.
-        if x.is_cuda:
-            try:
-                from sige3d.torch_kernels import get_kernel_backend
-
-                use_cuda = get_kernel_backend() == "cuda"
-            except Exception:
-                use_cuda = False
-
-            if use_cuda:
-                try:
-                    from sige3d.cuda_kernels import get_extension
-
-                    ext = get_extension()
-                    gamma = self.gamma.to(device=x.device, dtype=x.dtype).reshape(-1).contiguous()
-                    bias = None
-                    if torch.is_tensor(self.bias):
-                        bias = self.bias.to(device=x.device, dtype=x.dtype).reshape(-1).contiguous()
-                    return ext.rms_norm(x.contiguous(), gamma, bias, float(self.eps), bool(self.channel_first))
-                except Exception:
-                    pass
-
         gamma = self.gamma.to(device=x.device, dtype=x.dtype)
         bias = self.bias if not torch.is_tensor(self.bias) else self.bias.to(device=x.device, dtype=x.dtype)
         return F.normalize(x, dim=(1 if self.channel_first else -1), eps=self.eps) * self.scale * gamma + bias
@@ -262,7 +240,7 @@ class Resample(SIGEModule3d):
                         x = self.time_conv(x, feat_cache[idx])
                     feat_cache[idx] = cache_x
                     feat_idx[0] += 1
-                    
+
                     # 把时间维度扩展为2倍, 用通道维翻倍（2C）换来时间维翻倍（2T）
                     # 和空间上采样直接用Upsample(scale_factor=(2., 2.)不一样
                     x = x.reshape(b, 2, c, t, h, w)
@@ -323,7 +301,7 @@ class Resample(SIGEModule3d):
                         x = self.time_conv(x)
                     else:
                         cache = feat_cache[idx]
-                        cache = self.gather3d(cache)
+                        cache = self.gather3d(cache, is_cache_gather=True)
                         x = self.time_conv(x, cache)
                     feat_cache[idx] = cache_x
                     feat_idx[0] += 1
@@ -339,31 +317,33 @@ class Resample(SIGEModule3d):
                     # 把“2”插到时间维，变成 2T
                     x = x.permute(0, 2, 3, 1, 4, 5)         # [N, C, T, 2, bh, bw]
                     x = x.reshape(N, C, T * 2, bh, bw)      # [N, C, 2T, bh, bw]
-                    
+
                     x = self.scatter3d(x)
-                    
+
 
         # 统一做空间 2D resample
         t = x.shape[2]
         x = rearrange(x, 'b c t h w -> (b t) c h w')
+        # x = rearrange(x, 'b c t h w -> (b t) c h w').contiguous()
 
         if self.resample_mode == 'upsample3d' or self.resample_mode == 'upsample2d':
             x = self.spatupsample(x)
             x = self.gather2d(x)
+            # x = self.gather2d(x.float()).to(torch.bfloat16)
             x = self.conv(x)    # 2D卷积
             x = self.scatter2d(x)
-            
+
         if self.resample_mode == 'downsample2d' or self.resample_mode == 'downsample3d':
             # TODO: 稀疏计算的时候是不是不需要padding
             # DONE: 不需要
             x = self.gather2d(x)
+            # x = self.gather2d(x.float()).to(torch.bfloat16)
             if self.mode == "full":
                 x = self.downpad(x)
             x = self.conv(x)    # 2D卷积，通过stride=2下采样
             x = self.scatter2d(x)
-        
-        x = rearrange(x, '(b t) c h w -> b c t h w', t=t)
 
+        x = rearrange(x, '(b t) c h w -> b c t h w', t=t)
 
         if self.resample_mode == 'downsample3d':
             if feat_cache is not None:
@@ -376,9 +356,9 @@ class Resample(SIGEModule3d):
                     cache_x = x[:, :, -1:, :, :].clone()
 
                     x = self.gather3d(x)
-                    
+
                     cache = feat_cache[idx][:, :, -1:, :, :]
-                    cache = self.gather3d(cache)
+                    cache = self.gather3d(cache, is_cache_gather=True)
                     # x = self.time_conv(
                     #     torch.cat([feat_cache[idx][:, :, -1:, :, :], x], 2))
                     x = self.time_conv(torch.cat([cache, x], 2))
@@ -517,7 +497,7 @@ class ResidualBlock(SIGEModule3d):
 
         h = x
         if self.in_dim != self.out_dim:
-            h = self.shortcut_gather(h)
+            h = self.shortcut_gather(x)
             h = self.shortcut(h)
                  
         # gather自带rms_norm, 激活函数silu
@@ -695,7 +675,18 @@ class Encoder3d(SIGEModel3d):
             if isinstance(layer, ResidualBlock) and feat_cache is not None:
                 x = layer(x, feat_cache, feat_idx, is_first_frame)
             else:
+                # transformers
+                # torch.cuda.synchronize()
+                # start = torch.cuda.Event(enable_timing=True)
+                # end   = torch.cuda.Event(enable_timing=True)
+                # start.record()
+
                 x = layer(x)
+
+                # end.record()
+                # torch.cuda.synchronize()
+                # print(f"encoder transformers: {start.elapsed_time(end):.2f} ms")   # ms
+            
 
         # head
         # 针对head中的conv, 不进行稀疏计算
@@ -797,7 +788,18 @@ class Decoder3d(SIGEModel3d):
             if isinstance(layer, ResidualBlock) and feat_cache is not None:
                 x = layer(x, feat_cache, feat_idx, is_first_frame)
             else:
+               # transformers
+                # torch.cuda.synchronize()
+                # start = torch.cuda.Event(enable_timing=True)
+                # end   = torch.cuda.Event(enable_timing=True)
+                # start.record()
+
                 x = layer(x)
+
+                # end.record()
+                # torch.cuda.synchronize()
+                # print(f"decoder transformers: {start.elapsed_time(end):.2f} ms")   # ms
+            
 
         # upsamples
         for layer in self.upsamples:
@@ -1316,10 +1318,14 @@ def _parse_args(argv=None):
 @torch.no_grad()
 def main(argv=None):
     args = _parse_args(argv)
+    try:
+        from sige3d.torch_kernels.backend import set_kernel_backend
 
-    from sige3d.torch_kernels import set_kernel_backend
+        set_kernel_backend(args.sige_kernels)
+    except Exception:
+        # Keep default backend on failure (e.g., when running without SIGE3D installed).
+        pass
 
-    set_kernel_backend(args.sige_kernels)
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
     dtype = torch.bfloat16
@@ -1400,7 +1406,9 @@ def main(argv=None):
    
         #     print("SIGE MACs: %.2fG" % (m_enc / 1e9))
         #     exit(0)
-        if i > 0:
+
+        # chunk1 load cuda_so，不准
+        if i > 1:
             torch.cuda.synchronize()
             tot_s.record()
 
@@ -1473,12 +1481,12 @@ def main(argv=None):
     print(f"total avg= {tot_avg:.2f} ms")
 
 
-    # flow_time_enc_avg = np.mean(flow_time_enc)
-    # print(f"flow cache enc call times  = {len(flow_time_enc)}")
-    # print(f"flow cache enc avg  = {flow_time_enc_avg:.2f} ms")
-    # flow_time_dec_avg = np.mean(flow_time_dec)
-    # print(f"flow cache dec call times  = {len(flow_time_dec)}")
-    # print(f"flow cache dec avg  = {flow_time_dec_avg:.2f} ms")
+    flow_time_enc_avg = np.mean(flow_time_enc)
+    print(f"flow cache enc call times  = {len(flow_time_enc)}")
+    print(f"flow cache enc avg  = {flow_time_enc_avg:.2f} ms")
+    flow_time_dec_avg = np.mean(flow_time_dec)
+    print(f"flow cache dec call times  = {len(flow_time_dec)}")
+    print(f"flow cache dec avg  = {flow_time_dec_avg:.2f} ms")
 
 
     video = torch.cat(recon_video_list, dim=1)

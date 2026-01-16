@@ -38,11 +38,7 @@ class ScatterGather3d(SIGEModule3d):
         self.original_outputs = forward_warp_cache_5d(self.original_outputs, flow).contiguous()
 
     def forward(
-        self, x: torch.Tensor, scale: Optional[torch.Tensor] = None, shift: Optional[torch.Tensor] = None
-    ) -> torch.Tensor:
-        self.check_dtype(x, scale, shift)
-        self.check_dim(x, scale, shift)
-
+        self, x: torch.Tensor) -> torch.Tensor:
         active_indices = self.gather.module.active_indices
         block_size = self.gather.module.block_size
 
@@ -73,24 +69,33 @@ class ScatterGather3d(SIGEModule3d):
                 block_size[1],
                 active_indices.contiguous(),
                 self.scatter_map.contiguous(),
-                None if scale is None else scale.contiguous(),
-                None if shift is None else shift.contiguous(),
                 self.activation_name,
-                self.activation_first,
                 rms_norm_fn=self.rms_norm_fn,   # ✅ 改名，传函数
             )
-            if self.sparse_update:
-                updated = scatter3d(
-                    x.contiguous(),
-                    self.original_outputs.contiguous(),
-                    self.gather.module.offset[0],
-                    self.gather.module.offset[1],
-                    self.gather.module.model_stride[0],
-                    self.gather.module.model_stride[1],
-                    active_indices.contiguous(),
-                    None,
-                )
-                self.original_outputs.copy_(updated)
+
+            updated = scatter3d(
+                x.contiguous(),
+                self.original_outputs.contiguous(),
+                self.gather.module.offset[0],
+                self.gather.module.offset[1],
+                self.gather.module.model_stride[0],
+                self.gather.module.model_stride[1],
+                active_indices.contiguous(),
+                None,
+            )
+            
+            # if self.sparse_update:
+            #     updated = scatter3d(
+            #         x.contiguous(),
+            #         self.original_outputs.contiguous(),
+            #         self.gather.module.offset[0],
+            #         self.gather.module.offset[1],
+            #         self.gather.module.model_stride[0],
+            #         self.gather.module.model_stride[1],
+            #         active_indices.contiguous(),
+            #         None,
+            #     )
+            #     self.original_outputs.copy_(updated)
             return output
 
         raise NotImplementedError(f"Unknown mode: {self.mode}")
